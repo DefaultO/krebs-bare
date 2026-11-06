@@ -261,6 +261,11 @@ impl Lobbies {
         self.list.iter_mut().find(|l| l.id == id)
     }
 
+    /// The world of the match someone is in, once it runs. Before that, a spawn in it is known only to who placed it.
+    fn running_link(&mut self, user: &str) -> Option<Link> {
+        self.of(user).filter(|l| l.phase == Phase::Running).and_then(|l| l.link.clone())
+    }
+
     fn of(&mut self, user: &str) -> Option<&mut Lobby> {
         self.list.iter_mut().find(|l| l.seats.iter().any(|s| s.user == user && !s.away) || l.watchers.iter().any(|(w, _)| w == user))
     }
@@ -677,8 +682,7 @@ pub(crate) fn stop(_req: &Request, ctx: &ApiCtx) -> Response {
 /// GET /api/lobbies/live: the run you are in or watching, from its own server, so outside the lock every poll waits on.
 pub(crate) fn live(_req: &Request, ctx: &ApiCtx) -> Response {
     let Some(me) = player(ctx) else { return Response::unauthorized() };
-    let link = LOBBIES.lock().unwrap().of(&me.id).and_then(|l| l.link.clone());
-    let Some(link) = link else { return Response::error("There is no match running.") };
+    let Some(link) = LOBBIES.lock().unwrap().running_link(&me.id) else { return Response::error("There is no match running.") };
     match link.view() {
         Ok(view) => Response::ok(view),
         Err(why) => Response::error(&why),
@@ -693,8 +697,7 @@ pub(crate) fn rooms(req: &Request, ctx: &ApiCtx) -> Response {
     if wanted.len() > MAX_ROOMS_ASKED || !wanted.bytes().all(|b| b.is_ascii_alphanumeric() || b == b',') {
         return Response::error("Those are not room names.");
     }
-    let link = LOBBIES.lock().unwrap().of(&me.id).and_then(|l| l.link.clone());
-    let Some(link) = link else { return Response::error("There is no match running.") };
+    let Some(link) = LOBBIES.lock().unwrap().running_link(&me.id) else { return Response::error("There is no match running.") };
     match link.rooms(wanted) {
         Ok(json) => Response::text(200, "application/json; charset=utf-8", &json),
         Err(why) => Response::error(&why),
@@ -818,6 +821,19 @@ mod tests {
         all_ready(&mut l, &["a"]);
         l.refresh(Some("a"), 0);
         assert_eq!(l.get(id).unwrap().row(None, 1000).get("leftMs").and_then(Json::as_f64), Some((COUNTDOWN_MS - 1000) as f64));
+    }
+
+    #[test]
+    fn the_match_world_stays_closed_until_the_match_runs() {
+        let (mut l, id) = lobby(&["a", "b"]);
+        l.get(id).unwrap().link = Some(Link::nowhere());
+        for phase in [Phase::Picking, Phase::Spawning] {
+            l.get(id).unwrap().phase = phase;
+            assert!(l.running_link("b").is_none(), "a rival's spawn is already in that world");
+        }
+        l.get(id).unwrap().phase = Phase::Running;
+        assert!(l.running_link("b").is_some());
+        assert!(l.running_link("c").is_none(), "not your match");
     }
 
     #[test]

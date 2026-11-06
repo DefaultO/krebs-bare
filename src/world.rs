@@ -39,6 +39,13 @@ pub(crate) struct Link {
     port: u16,
 }
 
+#[cfg(test)]
+impl Link {
+    pub(crate) fn nowhere() -> Link {
+        Link { port: 0 }
+    }
+}
+
 pub(crate) struct World {
     process: Child,
     dir: PathBuf,
@@ -91,6 +98,7 @@ fn run(exe: &Path, what: &str, dir: &Path, args: &[&std::ffi::OsStr]) -> Result<
 /// A match's own `krebs.json`.
 fn child_config() -> Json {
     backend::http::obj(vec![
+        ("auth", backend::http::obj(vec![("steam", Json::Str("off".into()))])),
         ("persist", backend::http::obj(vec![("intervalS", Json::Num(NO_CHECKPOINTS_S))])),
         ("engine", backend::http::obj(vec![("cpuMaxPerTick", Json::Num(CPU_MAX_PER_TICK))])),
         ("runner", backend::http::obj(vec![("semiSpaceMb", Json::Num(SEMI_SPACE_MB)), ("setupList", Json::Bool(true))])),

@@ -13,8 +13,9 @@ Royale. Each match runs in a server process of its own, and that server needs th
 Turn it on with `"mods": ["bare"]` in `krebs.json`, or `krebs serve --mods bare`. `run.bat` does this when the folder is
 here, and then page files reload on a reconnect.
 
-Logging in reads the SteamID out of the client's ticket, and nothing proves a ticket is genuine, so this mod is not for a
-public server.
+Logging in takes the SteamID from the part of the client's ticket that Steam signed, and checks that signature itself. On a
+server other people can reach, Steam also has to confirm the ticket is in use, which takes the host's Steam Web API key
+(`src/ticket.rs`). Nothing is encrypted, so this mod is not for a public server.
 
 `landing.html`, `landing.js`, `worldmap.js`, `render.js` and `resolve.mjs` are the page. `src/` is the server side:
 `lobbies.rs` runs a lobby, `world.rs` runs a match's server, and `steam.rs` fetches players' pictures. `logos/` holds every

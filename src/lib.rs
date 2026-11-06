@@ -17,8 +17,8 @@
 //! client holds for this server. A menu template is compiled with the client's `CONFIG` in scope, and its `constructor`
 //! chain is the only way from there to `localStorage`.
 //!
-//! Logging in stays multi-user: core maps every Steam ticket to one account, so `steam_ticket` here reads the SteamID out
-//! of the ticket. Nothing proves a ticket is genuine, so this is not for a public server.
+//! Logging in stays multi-user: core maps every Steam ticket to one account, so `steam_ticket` here takes the SteamID from
+//! the part of the ticket Steam signed (`ticket`).
 
 use backend::api::auth::{default_code, new_user_doc};
 use backend::http::{obj, Request, Response};
@@ -30,6 +30,7 @@ use util::json::Json;
 
 mod lobbies;
 mod steam;
+mod ticket;
 mod world;
 
 /// The folder to read page files from on every request, so a reconnect shows an edit. run.bat sets it to this mod's
@@ -65,14 +66,7 @@ const SPRITES: &[(&str, &str)] = sprites!("commander-lvl0.svg" "commander-lvl1.s
 /// Off for now, and kept for Battle Royale: the world map and the room view, in place of the landing page.
 const WORLD_VIEW: bool = false;
 /// The real part of what the server card shows after the client's `v`.
-const CARD_VERSION: &str = "0.1";
-/// New accounts a minute, from everyone together. Nothing proves a ticket is genuine, so a caller could otherwise add
-/// accounts for as long as the server answers, and each one stays. An account that exists is never held up by this.
-const NEW_ACCOUNTS_A_MINUTE: u32 = 30;
-
-/// The minute it is and the accounts added in it.
-static NEW_ACCOUNTS: std::sync::Mutex<(u64, u32)> = std::sync::Mutex::new((0, 0));
-
+const CARD_VERSION: &str = "0.2";
 /// What the world view reads. `user/world-start-room` alone stops the map opening; the rest closes the way to a room.
 const WORLD_ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/user/world-start-room"),
@@ -262,29 +256,8 @@ fn font(req: &Request, ctx: &ApiCtx) -> Response {
     }
 }
 
-/// The SteamID64 in an auth session ticket (hex): u32 GC token length (20), u64 GC token, u64 SteamID.
-fn ticket_steam_id(ticket: &str) -> Option<u64> {
-    let le = |at: usize, n: usize| {
-        (0..n).rev().try_fold(0u64, |acc, i| {
-            let hex = ticket.get((at + i) * 2..(at + i) * 2 + 2)?;
-            Some(acc << 8 | u64::from(u8::from_str_radix(hex, 16).ok()?))
-        })
-    };
-    // an individual account in the public universe; anything else is not the layout above
-    (le(0, 4)? == 20).then(|| le(12, 8)).flatten().filter(|id| id >> 32 == 0x0110_0001)
-}
-
 fn has_steam_id(doc: &Obj, id: &str) -> bool {
     field(doc, "steam").and_then(Val::as_obj).and_then(|o| str_field(o, "id")) == Some(id)
-}
-
-/// Counts one more account in `minute`, and says whether it fits.
-fn one_more_account(seen: &mut (u64, u32), minute: u64) -> bool {
-    if seen.0 != minute {
-        *seen = (minute, 0);
-    }
-    seen.1 = seen.1.saturating_add(1);
-    seen.1 <= NEW_ACCOUNTS_A_MINUTE
 }
 
 /// The user for a SteamID64, created if new. A new user has no username yet: the client's own screen asks for one.
@@ -292,10 +265,6 @@ fn account(ctx: &ApiCtx, id: String) -> Result<UserIdx, String> {
     // an existing user needs no write, and no wait for the next tick's publish
     if let Some(u) = ctx.published.get().users.iter().position(|u| has_steam_id(&u.doc, &id)) {
         return Ok(u as UserIdx);
-    }
-    let minute = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |t| t.as_secs() / 60);
-    if !one_more_account(&mut NEW_ACCOUNTS.lock().unwrap(), minute) {
-        return Err("Too many new players at once. Try again in a minute.".into());
     }
     backend::write(ctx, move |w| {
         if let Some(u) = w.users.iter().position(|u| has_steam_id(&u.doc, &id)) {
@@ -314,7 +283,7 @@ fn steam_ticket(req: &Request, ctx: &ApiCtx) -> Response {
     if body.get("useNativeAuth").and_then(Json::as_bool) == Some(true) {
         return Response::error("authentication method is not supported");
     }
-    let Some(id) = body.get("ticket").and_then(Json::as_str).and_then(ticket_steam_id).map(|id| id.to_string()) else {
+    let Some(id) = body.get("ticket").and_then(Json::as_str).and_then(ticket::steam_id).map(|id| id.to_string()) else {
         return Response::error("could not authenticate");
     };
     let u = match account(ctx, id.clone()) {
@@ -337,6 +306,8 @@ impl Mod for Bare {
     }
 
     fn register(&self, r: &mut Registry) {
+        ticket::key();
+        ticket::ask_steam(r.steam_key.clone());
         // the client's welcome dialog only opens for a text
         r.server_data.push(("welcomeText", Json::Str(String::new())));
         r.routes.push(Route { method: "GET", path: "/api/version", handler: version });
@@ -411,12 +382,12 @@ mod tests {
         let mut version = obj(vec![("ok", Json::Num(1.0)), ("users", Json::Num(9.0))]);
         set_card(&mut version, &lobbies::Card { people: 3, open: 2, live: 1 });
         assert_eq!(version.get("users").and_then(Json::as_f64), Some(3.0), "the card breaks on anything but a number");
-        assert_eq!(version.get("packageVersion").and_then(Json::as_str), Some("0.1, 2 open, 1 live"));
+        assert_eq!(version.get("packageVersion").and_then(Json::as_str), Some("0.2, 2 open, 1 live"));
         assert_eq!(version.as_object().unwrap().len(), 3, "replaced, not doubled");
         set_card(&mut version, &lobbies::Card { people: 0, open: 0, live: 1 });
-        assert_eq!(version.get("packageVersion").and_then(Json::as_str), Some("0.1, 1 live"));
+        assert_eq!(version.get("packageVersion").and_then(Json::as_str), Some("0.2, 1 live"));
         set_card(&mut version, &lobbies::Card { people: 0, open: 0, live: 0 });
-        assert_eq!(version.get("packageVersion").and_then(Json::as_str), Some("0.1"));
+        assert_eq!(version.get("packageVersion").and_then(Json::as_str), Some("0.2"));
     }
 
     #[test]
@@ -448,24 +419,5 @@ mod tests {
             assert_eq!(&body[..4], b"wOF2", "{name}");
             assert!(PAGE_FILES[0].1.contains(&format!("/assets/{name}")), "{name}");
         }
-    }
-
-    #[test]
-    fn new_accounts_have_a_limit_a_minute() {
-        let mut seen = (0, 0);
-        assert!((0..NEW_ACCOUNTS_A_MINUTE).all(|_| one_more_account(&mut seen, 7)));
-        assert!(!one_more_account(&mut seen, 7));
-        assert!(one_more_account(&mut seen, 8), "the next minute starts over");
-    }
-
-    #[test]
-    fn a_ticket_gives_its_steam_id() {
-        const ID: u64 = 76561197960287930;
-        let mut bytes = vec![20u8, 0, 0, 0];
-        bytes.extend([0u8; 8]);
-        bytes.extend(ID.to_le_bytes());
-        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(ticket_steam_id(&hex), Some(ID));
-        assert_eq!(ticket_steam_id("00ff"), None);
     }
 }
