@@ -7,7 +7,7 @@ This mod is not made by, endorsed by or connected with the makers of Screeps. Th
 
 | What | Where | Licence |
 | --- | --- | --- |
-| 68 game sprites, from [screeps/renderer](https://github.com/screeps/renderer) `metadata/images`. 36 had comments and whitespace taken out, and the art is unchanged | `game-assets/` | ISC |
+| 68 game sprites, from [screeps/renderer](https://github.com/screeps/renderer) `metadata/images`, unchanged | `game-assets/` | ISC |
 | The drawing recipes in `render.js`, from the `metadata` of the same project | `render.js` | ISC |
 | Big Shoulders Display, Inter, JetBrains Mono | `*.woff2` | SIL OFL 1.1, texts in `licences/` |
 

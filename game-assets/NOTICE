@@ -3,8 +3,7 @@ https://github.com/screeps/renderer, folder metadata/images.
 
 They are under the ISC licence below, not under the MIT licence of Krebs.
 
-32 files are the same as upstream, byte for byte. The other 36 were optimised: comments and
-whitespace were taken out. The art in every file is unchanged.
+All 68 files are unchanged copies.
 
 Copyright (c) 2016, Artem Chivchalov <contact@screeps.com>
 
