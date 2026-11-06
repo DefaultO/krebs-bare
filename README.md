@@ -1,10 +1,10 @@
 # krebs-bare
 
-A mod for [Krebs](https://gitea.defaul.to/DefaultO/krebs). It lives at `mods/bare` in the core, as a git submodule, and it
-builds only inside the core. To get it:
+A mod for Krebs, which is on [GitHub](https://github.com/DefaultO/krebs) and [Gitea](https://gitea.defaul.to/DefaultO/krebs).
+Either one is enough. It lives at `mods/bare` in the core, as a git submodule, and it builds only inside the core. To get it:
 
 ```
-git clone --recursive https://gitea.defaul.to/DefaultO/krebs.git
+git clone --recursive https://github.com/DefaultO/krebs.git
 ```
 
 This is what Krebs players see. It strips the stock Screeps Steam client down to a landing page with lobbies and Battle
@@ -19,7 +19,7 @@ server other people can reach, Steam also has to confirm the ticket is in use, w
 
 `landing.html`, `landing.js`, `worldmap.js`, `render.js` and `resolve.mjs` are the page. `src/` is the server side:
 `lobbies.rs` runs a lobby, `world.rs` runs a match's server, and `steam.rs` fetches players' pictures. `logos/` holds every
-logo and what made it. More in [mods/README.md](https://gitea.defaul.to/DefaultO/krebs/src/branch/main/mods/README.md) in the
+logo and what made it. More in `mods/README.md` in the
 core.
 
 The code is under the MIT licence, see `LICENSE`. The sprites in `game-assets/` and the fonts are not, see
