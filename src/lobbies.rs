@@ -141,13 +141,17 @@ impl Seat {
         Seat { user: me.id.clone(), name: me.name.clone(), steam: me.steam.clone(), color, account: String::new(), code: None, ready: false, room: None, locked: false, spawned: false, tile: None, seen_ms: now, away: false }
     }
 
+    /// The name on Steam, which can arrive after the seat was taken and follows a change there.
+    fn shown_name(&self) -> String {
+        steam::picture(&self.steam).name.unwrap_or_else(|| self.name.clone())
+    }
 }
 
 /// Each seat's name for an account in a world, which takes `^[a-zA-Z0-9_-]{3,}$` and no two alike: (user, account).
 fn account_names(seats: &[Seat]) -> Vec<(String, String)> {
     let mut names: Vec<(String, String)> = Vec::new();
     for (i, seat) in seats.iter().enumerate() {
-        let clean: String = seat.name.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-')).collect();
+        let clean: String = seat.shown_name().chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-')).collect();
         let taken = names.iter().any(|(_, name)| name.eq_ignore_ascii_case(&clean));
         names.push((seat.user.clone(), if clean.len() < 3 || taken { format!("Player{}", i + 1) } else { clean }));
     }
@@ -155,6 +159,11 @@ fn account_names(seats: &[Seat]) -> Vec<(String, String)> {
 }
 
 impl Lobby {
+    /// Called after the host, whose name on Steam can arrive after the lobby was made.
+    fn title(&self) -> String {
+        self.seats.first().map_or_else(|| self.name.clone(), |host| format!("{}'s lobby", host.shown_name()))
+    }
+
     fn seat(&mut self, user: &str) -> Option<&mut Seat> {
         self.seats.iter_mut().find(|s| s.user == user)
     }
@@ -204,7 +213,7 @@ impl Lobby {
         let open = self.phase == Phase::Open || self.phase == Phase::Countdown;
         obj(vec![
             ("id", Json::Num(self.id as f64)),
-            ("name", Json::Str(self.name.clone())),
+            ("name", Json::Str(self.title())),
             ("players", Json::Num(self.seats.len() as f64)),
             ("max", Json::Num(MAX_SEATS as f64)),
             ("phase", Json::Str(self.phase.word().into())),
@@ -215,16 +224,17 @@ impl Lobby {
             ("leftMs", Json::Num(if self.phase == Phase::Countdown { self.ends_ms.saturating_sub(now) as f64 } else { 0.0 })),
             ("tick", Json::Num(self.tick as f64)),
             ("ticks", Json::Num(TICKS as f64)),
-            ("seats", Json::Arr(self.seats.iter().map(|s| steam::seat_json(&s.name, s.color, s.ready, &steam::picture(&s.steam))).collect())),
+            ("seats", Json::Arr(self.seats.iter().map(|s| steam::seat_json(&s.shown_name(), s.color, s.ready, &steam::picture(&s.steam))).collect())),
         ])
     }
 
     fn detail(&self, me: &str, now: u64) -> Json {
         let seats = self.seats.iter().enumerate().map(|(i, s)| {
             let picture = steam::picture(&s.steam);
+            let name = picture.name.unwrap_or_else(|| s.name.clone());
             let [avatar, frame] = [picture.avatar, picture.frame].map(|v| v.map_or(Json::Null, Json::Str));
             obj(vec![
-                ("name", Json::Str(s.name.clone())),
+                ("name", Json::Str(name)),
                 ("avatar", avatar),
                 ("frame", frame),
                 ("account", Json::Str(s.account.clone())),
@@ -241,7 +251,7 @@ impl Lobby {
         });
         obj(vec![
             ("id", Json::Num(self.id as f64)),
-            ("name", Json::Str(self.name.clone())),
+            ("name", Json::Str(self.title())),
             ("phase", Json::Str(self.phase.word().into())),
             ("leftMs", Json::Num(self.ends_ms.saturating_sub(now) as f64)),
             ("tick", Json::Num(self.tick as f64)),
@@ -427,7 +437,7 @@ impl Lobbies {
         }
         let seat = lobby.seats.iter_mut().find(|s| by(s)).ok_or((403, "You are not in a lobby."))?;
         seat.code = Some(code);
-        Ok(lobby.name.clone())
+        Ok(lobby.title())
     }
 }
 
@@ -437,12 +447,13 @@ struct Player {
     steam: String,
 }
 
-/// Who is asking. A new player has no username yet, as the landing page covers the client's name screen.
+/// Who is asking. People go by their name on Steam. A new player has no username in this world, as the landing page covers
+/// the client's name screen, so without a readable profile only the end of their SteamID is left.
 fn player(ctx: &ApiCtx) -> Option<Player> {
     let view = ctx.published.get();
     let st = view.users.get(ctx.user? as usize)?;
     let steam = field(&st.doc, "steam").and_then(Val::as_obj).and_then(|o| str_field(o, "id")).unwrap_or("");
-    let name = str_field(&st.doc, "username").map_or_else(|| format!("Player {}", &steam[steam.len().saturating_sub(4)..]), str::to_string);
+    let name = steam::picture(steam).name.or_else(|| str_field(&st.doc, "username").map(str::to_string)).unwrap_or_else(|| format!("Player {}", &steam[steam.len().saturating_sub(4)..]));
     Some(Player { id: st.id.as_str().to_string(), name, steam: steam.to_string() })
 }
 

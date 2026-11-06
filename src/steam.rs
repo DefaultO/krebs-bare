@@ -1,4 +1,4 @@
-//! Players' pictures, as they are on Steam: the animated avatar and its frame, or the plain avatar. Steam's public profile
+//! Players as they are on Steam: their name, the animated avatar and its frame, or the plain avatar. Steam's public profile
 //! XML and item list need no API key. std has no TLS, so curl fetches them, away from the requests that want them: a poll
 //! gets what is already known, and a new player's picture appears a poll or two later.
 
@@ -14,11 +14,14 @@ use util::json::Json;
 const REFRESH: Duration = Duration::from_secs(600);
 /// Fetches at once. Each is a thread and two curl processes, and new players can turn up faster than Steam answers.
 const MAX_FETCHES: usize = 4;
+/// What Steam itself allows for a profile name.
+const MOST_NAME_CHARS: usize = 32;
 /// Where the relative image paths of Steam's profile items live.
 const ITEM_IMAGES: &str = "https://shared.fastly.steamstatic.com/community_assets/images/";
 
 #[derive(Clone, Default, PartialEq, Debug)]
 pub(crate) struct Picture {
+    pub name: Option<String>,
     pub avatar: Option<String>,
     pub frame: Option<String>,
 }
@@ -95,7 +98,13 @@ fn fetch(steam_id: &str) -> Option<Picture> {
     let avatar = cdata(&xml, "avatarFull").filter(|url| is_avatar_url(url));
     let items = curl(&format!("https://api.steampowered.com/IPlayerService/GetProfileItemsEquipped/v1/?steamid={steam_id}"));
     let (animated, frame) = items.as_deref().map_or((None, None), equipped);
-    Some(Picture { avatar: animated.or(avatar), frame })
+    Some(Picture { name: cdata(&xml, "steamID").and_then(|name| clean_name(&name)), avatar: animated.or(avatar), frame })
+}
+
+/// A name as people can set it on Steam, so not trusted to be short or printable.
+fn clean_name(name: &str) -> Option<String> {
+    let kept: String = name.chars().filter(|c| !c.is_control()).take(MOST_NAME_CHARS).collect();
+    Some(kept.trim().to_string()).filter(|name| !name.is_empty())
 }
 
 /// `<tag><![CDATA[value]]></tag>`, first occurrence: the profile's own fields come before its groups and games.
@@ -138,6 +147,21 @@ mod tests {
         let xml = "<profile><steamID><![CDATA[Neo]]></steamID><avatarFull><![CDATA[https://a/1.jpg]]></avatarFull><groups><avatarFull><![CDATA[https://a/2.jpg]]></avatarFull></groups></profile>";
         assert_eq!(cdata(xml, "avatarFull").as_deref(), Some("https://a/1.jpg"));
         assert_eq!(cdata(xml, "nothing"), None);
+    }
+
+    #[test]
+    fn the_name_is_the_one_on_the_profile() {
+        let xml = "<profile><steamID64>76561197960287930</steamID64><steamID><![CDATA[Neo]]></steamID><groups><steamID><![CDATA[Not this]]></steamID></groups></profile>";
+        assert_eq!(cdata(xml, "steamID").as_deref(), Some("Neo"));
+    }
+
+    #[test]
+    fn a_name_is_cleaned_and_kept_short() {
+        assert_eq!(clean_name("  Дима\n").as_deref(), Some("Дима"));
+        assert_eq!(clean_name("a\u{0}b\u{7}").as_deref(), Some("ab"));
+        assert_eq!(clean_name(&"x".repeat(100)).map(|n| n.chars().count()), Some(MOST_NAME_CHARS));
+        assert_eq!(clean_name("   "), None);
+        assert_eq!(clean_name(""), None);
     }
 
     #[test]

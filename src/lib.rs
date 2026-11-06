@@ -290,6 +290,8 @@ fn steam_ticket(req: &Request, ctx: &ApiCtx) -> Response {
         Ok(u) => u,
         Err(e) => return Response::error(&e),
     };
+    // asked for now, so that the name is known before anyone makes a lobby
+    steam::picture(&id);
     let view = ctx.published.get();
     let Some(st) = view.users.get(u as usize) else { return Response::error("could not authenticate") };
     Response::ok(obj(vec![("token", Json::Str(authlib::gen_token(st.id.as_str()))), ("steamid", Json::Str(id))]))
