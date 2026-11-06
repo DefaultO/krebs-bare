@@ -1,0 +1,67 @@
+/* Loaded by the Screeps client on every page. Edit and reconnect to see changes.
+   The menu items themselves are gone, see src/lib.rs. This hides what is left and places the one button. */
+
+/* The top bar, and the space the pages keep for it. */
+header.navbar, .ptr-header { display: none !important; }
+.page-content, .page-content.ptr { top: 0 !important; }
+
+/* The old side menu, and what the new one leaves behind. */
+md-sidenav[md-component-id="main"], .md-sidenav-backdrop, app-menu .menu__shadow, app-menu .menu__overlay, app-menu footer,
+app-menu ol::before, app-menu li.bare-hidden, app-menu .__dust { display: none !important; }
+
+/* The banner above the world map, the room's button for the overview page, and the tips that pop up. */
+.new-map-header, .left-controls a[href*="#!/overview"], .tutorial { display: none !important; }
+section.world-map .map-container { top: 0 !important; }
+
+/* Exit server. The menu stays hidden as a whole, so the button has to climb out of it. */
+app-menu, app-menu .menu__wrapper, app-menu .menu {
+  width: 0 !important;
+  min-height: 0 !important;
+  max-height: none !important;
+  height: 0 !important;
+  overflow: visible !important;
+  opacity: 1 !important;
+  transform: none !important;
+  pointer-events: none !important;
+}
+/* Leaving is on the page's own bar now, which presses this item. It stays in the page, out of sight. */
+app-menu li.bare-exit { display: none !important; }
+app-menu li.bare-exit-old {
+  position: fixed !important;
+  z-index: 1000;
+  top: 10px;
+  left: calc(50% + 170px);
+  width: auto !important;
+  max-width: none !important;
+  pointer-events: auto;
+}
+app-menu li.bare-exit .menu__item {
+  box-sizing: border-box !important;
+  display: inline-flex !important;
+  width: auto !important;
+  min-height: 32px !important;
+  padding: 0 14px !important;
+  background: #252522 !important;
+  border: 0 !important;
+  border-radius: 0;
+  color: #f0ede6 !important;
+  font-size: 13px;
+  font-weight: 500 !important;
+  white-space: nowrap;
+  transition: background-color .1s linear, color .1s linear;
+}
+app-menu li.bare-exit .menu__item:hover, app-menu li.bare-exit .menu__item:focus {
+  background: #58d694 !important;
+  color: #0a0a0a !important;
+}
+
+/* Not on the client's server list, which is where it leads. */
+app-menu:has(~ app-nw-menu) li.bare-exit { display: none !important; }
+
+/* Links out to the pages that are gone. */
+a[href*="#!/profile"], a[href*="#!/account"], a[href*="#!/market"], a[href*="#!/messages"], a[href*="#!/overview"], a[href*="#!/inventory"], a[href*="#!/rank"] {
+  pointer-events: none !important;
+  cursor: default !important;
+  color: inherit !important;
+  text-decoration: none !important;
+}

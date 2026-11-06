@@ -1,0 +1,11 @@
+[package]
+name = "mod-bare"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Strips the stock Steam client down to the game: no menu, no top bar, no pages, no endpoints they used"
+
+[dependencies]
+backend = { path = "../../crates/backend" }
+engine = { path = "../../crates/engine" }
+util = { path = "../../crates/util" }

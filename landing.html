@@ -1,0 +1,761 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Krebs</title>
+<style>
+/* Depth is layers overlapping and nothing else: flat colour, no shadow, no glow, no gradient, no blur, square corners.
+   Nothing moves without a reason. Each transition below carries its class: P answers the player, S shows a change of state,
+   M moves between screens. Anything with none of the three is not here. */
+
+/* Big Shoulders (Patric King, for the City of Chicago's identity) for what must shout, Inter (Rasmus Andersson) for reading,
+   JetBrains Mono for captions and data. All SIL OFL, see licences/. The Latin Extended, Cyrillic and Greek files load only
+   for a name that needs them. */
+@font-face {
+  font-family: "Display";
+  src: url("/assets/display.woff2") format("woff2");
+  font-weight: 100 900;
+  font-display: block;
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: "Display";
+  src: url("/assets/display-ext.woff2") format("woff2");
+  font-weight: 100 900;
+  font-display: block;
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: "Text";
+  src: url("/assets/text.woff2") format("woff2");
+  font-weight: 100 900;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Text";
+  src: url("/assets/text-cyrillic.woff2") format("woff2");
+  font-weight: 100 900;
+  font-display: swap;
+  unicode-range: U+0301, U+0400-045F, U+0490-0491, U+04B0-04B1, U+2116;
+}
+@font-face {
+  font-family: "Text";
+  src: url("/assets/text-greek.woff2") format("woff2");
+  font-weight: 100 900;
+  font-display: swap;
+  unicode-range: U+0370-0377, U+037A-037F, U+0384-038A, U+038C, U+038E-03A1, U+03A3-03FF;
+}
+@font-face {
+  font-family: "Mono";
+  src: url("/assets/mono.woff2") format("woff2");
+  font-display: block;
+}
+
+:root {
+  /* Every step has one job. There is no red: an error is a cream plate and a word. */
+  --ground: #0C0B09;
+  --sheet-1: #151310;
+  --sheet-2: #1E1C17;
+  --sheet-3: #2A2720;
+  --cream: #F2EBDD;
+  --ink-2: #B5AFA2;
+  --ink-3: #8C877B;
+  --on-cream: #4A463C;
+  --go: #58D694;
+  --void: #000000;
+
+  --display: "Display", "Arial Narrow", "Yu Gothic UI", "Microsoft YaHei UI", "Malgun Gothic", sans-serif;
+  --text: "Text", "Yu Gothic UI", "Microsoft YaHei UI", "Malgun Gothic", "Segoe UI", sans-serif;
+  --mono: "Mono", Consolas, monospace;
+
+  --out: cubic-bezier(.05, .7, .1, 1);      /* arrivals */
+  --move: cubic-bezier(.2, 0, 0, 1);        /* click-started moves, because it responds at once */
+  --long: cubic-bezier(.77, 0, .175, 1);    /* 400 ms or longer, and never click-started */
+  --leave: cubic-bezier(.3, 0, .8, .15);    /* only a surface fully leaving the frame */
+
+  /* Band S: the default, and any window short of the next band on either axis */
+  --rail: 56px;
+  --strip: 8px;
+  --panel: 244px;
+  --pad: 16px;
+  --row: 84px;
+  --plate: 84px;
+  --host: 72px;
+  --avatar: 44px;
+  --overlap: 14px;
+  --grow: 12px;
+  --join: 90px;
+  --cap-gap: 8px;
+  --name-gap: 6px;
+  --tick-gap: 9px;
+  --facts-top: 142px;
+  --over-top: 196px;
+  --seat-over: 13px;
+  --seat-gap: 16px;
+  --idx: 28px;
+  --roster-gap: 12px;
+  --state-gap: 16px;
+  --pick-row: 35px;
+  --live-row: 48px;
+  --live-avatar: 35px;
+  --pin: 24px;
+  --arm: 16px;
+  --b: 2px;
+  --b-x: 8px;
+  --b-y: 6px;
+  --ring: 1px;
+  --track: -.006em;
+  --t-cap: 12px;
+  --t-text: 14px;
+  --t-sub: 29px;
+  --t-name: 47px;
+  --t-title: 76px;
+  --t-tick: 122px;
+  --t-mass: 197px;
+
+  --stack: calc(var(--host) + 7 * (var(--avatar) - var(--overlap)));
+  --step: calc((100vh - var(--rail) - var(--roster-gap)) / 8);
+  --seat: calc(var(--step) + var(--seat-over));
+  --glyph: calc(var(--rail) * 9 / 14);
+}
+@media (min-width: 1250px) and (min-height: 875px) {
+  :root {
+    --rail: 64px; --strip: 10px; --panel: 320px; --pad: 20px; --row: 104px; --plate: 104px; --host: 90px; --avatar: 56px; --overlap: 18px;
+    --grow: 14px; --join: 110px; --cap-gap: 10px; --name-gap: 7px; --tick-gap: 12px; --facts-top: 175px; --over-top: 236px; --seat-over: 14px; --seat-gap: 20px; --idx: 34px; --roster-gap: 14px; --state-gap: 20px;
+    --pick-row: 44px; --live-row: 58px; --live-avatar: 44px; --pin: 28px; --arm: 20px; --b: 2px; --b-x: 10px; --b-y: 7px;
+    --t-cap: 13px; --t-text: 15px; --t-sub: 36px; --t-name: 59px; --t-title: 95px; --t-tick: 152px; --t-mass: 246px;
+  }
+}
+@media (min-width: 1500px) and (min-height: 1050px) {
+  :root {
+    --rail: 72px; --strip: 12px; --panel: 420px; --pad: 24px; --row: 126px; --plate: 126px; --host: 108px; --avatar: 66px; --overlap: 21px;
+    --grow: 16px; --join: 140px; --cap-gap: 14px; --name-gap: 8px; --tick-gap: 16px; --facts-top: 208px; --over-top: 300px; --seat-over: 16px; --seat-gap: 24px; --idx: 40px; --roster-gap: 16px; --state-gap: 24px;
+    --pick-row: 56px; --live-row: 70px; --live-avatar: 53px; --pin: 32px; --arm: 24px; --b: 3px; --b-x: 12px; --b-y: 8px; --ring: 2px; --track: -.011em;
+    --t-cap: 14px; --t-text: 16px; --t-sub: 47px; --t-name: 76px; --t-title: 122px; --t-tick: 197px; --t-mass: 319px;
+  }
+}
+@media (min-width: 2000px) and (min-height: 1400px) {
+  :root {
+    --rail: 80px; --strip: 16px; --panel: 520px; --pad: 32px; --row: 168px; --plate: 168px; --host: 144px; --avatar: 88px; --overlap: 28px;
+    --grow: 20px; --join: 176px; --cap-gap: 18px; --name-gap: 10px; --tick-gap: 20px; --facts-top: 270px; --over-top: 375px; --seat-over: 20px; --seat-gap: 32px; --idx: 52px; --roster-gap: 20px; --state-gap: 32px;
+    --pick-row: 72px; --live-row: 92px; --live-avatar: 70px; --pin: 40px; --arm: 32px; --b: 4px; --b-x: 16px; --b-y: 10px; --ring: 2px; --track: -.011em;
+    --t-cap: 16px; --t-text: 18px; --t-sub: 58px; --t-name: 94px; --t-title: 152px; --t-tick: 244px; --t-mass: 394px;
+  }
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: var(--ground);
+  color: var(--cream);
+  font: 450 var(--t-text)/1.4 var(--text);
+  user-select: none;
+}
+button {
+  appearance: none;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+ul, ol { margin: 0; padding: 0; list-style: none; }
+p, h2, dl, dd { margin: 0; }
+i { font-style: normal; }
+::-webkit-scrollbar { width: 0; }
+:focus-visible { outline: 2px solid var(--cream); outline-offset: -2px; }
+
+/* The paper's grain: still, baked into one tile made at load, and painted into the sheets, never over the map */
+.paper, li.lobby, #list.scrolled .head { background-image: var(--grain); background-size: calc(512px / var(--dpr, 1)); image-rendering: pixelated; }
+.paper > *, li.lobby > *, #list.scrolled .head > * { image-rendering: auto; }
+
+.cap {
+  color: var(--ink-2);
+  font: 500 var(--t-cap)/1 var(--mono);
+  font-variant-ligatures: none;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.text { color: var(--ink-2); font: 450 var(--t-text)/1.4 var(--text); font-variant-numeric: tabular-nums; letter-spacing: var(--track); }
+.title { color: var(--cream); font: 800 var(--t-title)/.96 var(--display); text-box: trim-both cap alphabetic; text-transform: uppercase; white-space: nowrap; }
+
+/* A figure that changes in place goes in boxes that never change size: the display face has no tabular figures */
+.digits { display: flex; font: 800 var(--size)/.82 var(--display); letter-spacing: -.01em; }
+.digits i { display: block; flex: none; width: .5em; text-align: center; text-box: trim-both cap alphabetic; }
+.mass { --size: var(--t-mass); height: calc(var(--t-mass) * .812); margin: var(--cap-gap) 0 var(--pad) calc(var(--size) * -.055); }
+.tick { --size: var(--t-tick); margin-top: var(--cap-gap); margin-left: calc(var(--size) * -.055); }
+.tick.four { --size: calc(var(--t-tick) * .82); }
+
+.read { display: grid; grid-template-columns: max-content 1fr; gap: 8px 16px; }
+.read dt { color: var(--ink-2); font: inherit; }
+.read dd { color: var(--cream); font: inherit; }
+.read { font: 500 var(--t-cap)/1 var(--mono); font-variant-ligatures: none; letter-spacing: .06em; text-transform: uppercase; }
+
+/* The note is an error: a cream plate and a word. There is no red. */
+.note { display: none; padding: 10px var(--pad); background: var(--cream); color: var(--ground); font: 450 var(--t-text)/1.4 var(--text); letter-spacing: var(--track); }
+.note.on { display: block; }
+.note-slide { position: absolute; left: 0; right: 0; bottom: 0; overflow: hidden; pointer-events: none; }
+/* S, a taken room or a refused tile: the one slide kept for something you must act on */
+.note-slide .note { display: block; transform: translateY(101%); visibility: hidden; transition: transform 200ms var(--out), visibility 0s 200ms; }
+.note-slide .note.on { transform: none; visibility: visible; transition: transform 200ms var(--out); }
+
+/* ---- the layers, bottom to top ---- */
+#stage { position: fixed; z-index: 1; top: 0; bottom: 0; left: var(--rail); right: var(--panel); overflow: hidden; background-color: var(--ground); }
+#panel { position: fixed; z-index: 2; top: 0; bottom: 0; right: 0; width: var(--panel); background: var(--sheet-2); }
+#rail { position: fixed; z-index: 3; top: 0; bottom: 0; left: 0; width: var(--rail); background-color: var(--ground); }
+#settings { z-index: 4; }
+#plate-clip { z-index: 5; }
+
+/* ---- the rail: where you are in a match, which server this is, and the way out ---- */
+.mod { position: relative; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; width: var(--rail); height: var(--rail); text-align: center; }
+#mark { color: var(--cream); }
+#mark svg { display: block; width: var(--glyph); height: var(--glyph); }
+#block { position: absolute; top: var(--rail); left: 0; width: var(--rail); height: var(--rail); background: var(--cream); transition: transform 200ms var(--move); /* M */ }
+#stages { position: relative; }
+.mod .n, .mod .w { color: var(--ink-3); font: 500 var(--t-cap)/1 var(--mono); font-variant-ligatures: none; letter-spacing: .02em; text-transform: uppercase; }
+.mod.past .w { color: var(--ink-2); }
+.mod.now .n, .mod.now .w { color: var(--ground); }
+#back { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--cream); font: 500 var(--t-cap)/1.3 var(--mono); font-variant-ligatures: none; letter-spacing: .02em; text-transform: uppercase; }
+#server {
+  position: absolute;
+  bottom: calc(var(--rail) * 2);
+  left: 0;
+  width: var(--rail);
+  display: flex;
+  justify-content: center;
+  padding: var(--pad) 0;
+  color: var(--ink-3);
+  font: 500 var(--t-cap)/1 var(--mono);
+  font-variant-ligatures: none;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+#server span { writing-mode: vertical-rl; transform: rotate(180deg); }
+#server.lost { background: var(--cream); color: var(--ground); }
+#you { position: absolute; bottom: var(--rail); left: 0; }
+#you .avatar { --size: var(--glyph); width: var(--glyph); height: var(--glyph); outline: 0; }
+#you:focus-visible { outline-offset: -4px; }
+#leave-mod { position: absolute; bottom: 0; left: 0; padding: 4px; }
+#leave { width: 100%; height: 100%; color: var(--cream); font: 500 var(--t-cap)/1.2 var(--mono); font-variant-ligatures: none; letter-spacing: 0; text-transform: uppercase; outline: var(--ring) solid var(--ink-3); outline-offset: calc(var(--ring) * -1); }
+
+/* Held, not clicked. Two copies of the words, so they invert exactly at the fill's edge. A hold is not an error, so it is cream. */
+.hold { position: relative; transition: transform 120ms var(--move); /* P, the press */ }
+.hold:active { transform: scale(.97); }
+.hold .lab, .hold .fill { display: flex; align-items: center; justify-content: center; width: 100%; height: 100%; text-align: center; }
+.hold .fill {
+  position: absolute;
+  inset: 0;
+  background: var(--cream);
+  color: var(--ground);
+  clip-path: inset(0 100% 0 0);
+  transition: clip-path 200ms var(--out); /* P, released early costs nothing */
+  pointer-events: none;
+}
+.hold.held .fill { clip-path: inset(0 0 0 0); transition: clip-path var(--hold, 1000ms) linear; /* P, the time left to change your mind */ }
+
+/* What letting go would not cost and holding would, sliding out of the rail. It covers no control. */
+#plate-clip { position: fixed; left: var(--rail); bottom: 0; height: var(--rail); overflow: hidden; pointer-events: none; }
+#plate { display: flex; align-items: center; height: 100%; padding: 0 var(--pad); background: var(--cream); color: var(--ground); font: 500 var(--t-cap)/1 var(--mono); font-variant-ligatures: none; letter-spacing: .06em; text-transform: uppercase; white-space: nowrap; transform: translateX(-101%); transition: transform 120ms var(--move); /* P */ }
+#plate.on { transform: none; }
+
+/* You: a flat sheet opening from the trigger */
+#settings {
+  position: fixed;
+  bottom: var(--rail);
+  left: var(--rail);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 260px;
+  padding: var(--pad);
+  background: var(--sheet-2);
+  opacity: 0;
+  visibility: hidden;
+  transform: scale(.96);
+  transform-origin: 0 100%;
+  transition: transform 120ms var(--out), opacity 120ms var(--out), visibility 0s 120ms; /* P, out */
+}
+#settings.on { opacity: 1; visibility: visible; transform: none; transition: transform 160ms var(--out), opacity 160ms var(--out); /* P, in */ }
+#settings b { display: block; max-width: 420px; margin-bottom: var(--pad); overflow-x: clip; font: 800 var(--t-name)/1 var(--display); text-overflow: ellipsis; text-transform: uppercase; white-space: nowrap; }
+#settings b.alien { font: 700 calc(var(--t-name) * .72)/calc(1 / .72) var(--text); text-transform: none; }
+#settings button { display: flex; align-items: center; height: 36px; text-align: left; color: var(--cream); }
+#settings button .cap { color: inherit; }
+
+/* ---- the panel: two offset sheets, so its edge reads as a shape whatever terrain lies against it ---- */
+#progress { position: absolute; top: 0; left: 0; width: var(--strip); height: 100%; background: var(--ink-3); transform: scaleY(0); transform-origin: 0 0; }
+#front { position: absolute; top: 0; bottom: 0; left: var(--strip); right: 0; background-color: var(--ground); }
+.side { position: absolute; inset: 0; display: none; padding: var(--pad); }
+
+.plate {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 4px;
+  height: var(--plate);
+  padding: 0 var(--pad);
+  background: var(--cream);
+  color: var(--ground);
+  font: 800 var(--t-name)/1 var(--display);
+  text-transform: uppercase;
+  white-space: nowrap;
+  transition: transform 120ms var(--move); /* P, the press */
+}
+.plate:active { transform: scale(.97); }
+.plate .cap { color: var(--on-cream); max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+.plate[data-tone="go"] { background: var(--go); }
+.plate[data-tone="go"] .cap { color: var(--ground); }
+.plate[data-tone="line"], .plate[data-tone="done"] { background: var(--ground); color: var(--cream); outline: var(--ring) solid var(--ink-3); outline-offset: calc(var(--ring) * -1); }
+.plate[data-tone="done"] { cursor: default; }
+.plate[data-tone="done"]:active { transform: none; }
+.plate:focus-visible { outline: 2px solid var(--ground); outline-offset: -5px; }
+.plate[data-tone="line"]:focus-visible, .plate[data-tone="done"]:focus-visible { outline: 2px solid var(--cream); outline-offset: -5px; }
+#new-lobby { bottom: var(--plate); height: var(--rail); font: 700 var(--t-sub)/1 var(--display); letter-spacing: .01em; }
+body:not([data-view="list"]) #new-lobby, body:not([data-view="over"]) #stop { display: none; }
+#stop { position: absolute; left: 0; right: 0; bottom: 0; height: var(--rail); color: var(--ink-2); font: 700 var(--t-sub)/1 var(--display); letter-spacing: .01em; text-transform: uppercase; outline: var(--ring) solid var(--ink-3); outline-offset: calc(var(--ring) * -1); }
+#stop .lab, #stop .fill { justify-content: flex-start; padding: 0 var(--pad); }
+#stop-clip { position: absolute; left: 0; right: 0; bottom: var(--rail); overflow: hidden; pointer-events: none; }
+#stop-plate { padding: 10px var(--pad); background: var(--cream); color: var(--ground); font: 500 var(--t-cap)/1.3 var(--mono); font-variant-ligatures: none; letter-spacing: .06em; text-transform: uppercase; transform: translateY(101%); visibility: hidden; transition: transform 120ms var(--move), visibility 0s 120ms; /* P */ }
+#stop-plate.on { transform: none; visibility: visible; transition: transform 120ms var(--move); }
+
+/* Dragging a folder over the window: the front sheet flips, and the slot stands aside */
+#drop-sheet { position: absolute; inset: 0; display: none; align-items: flex-start; padding: var(--pad); background: var(--cream); color: var(--ground); font: 800 min(var(--t-tick), calc((var(--panel) - var(--strip) - var(--pad) * 2) / 1.81))/.96 var(--display); text-transform: uppercase; }
+body.over #drop-sheet { display: flex; }
+body.over #slot, body.over #new-lobby { display: none; }
+
+/* ---- which screen is up ---- */
+#list, #lobby, #world { display: none; }
+body[data-view="list"] #list, body[data-view="lobby"] #lobby { display: block; }
+body[data-view="pick"] #world, body[data-view="spawn"] #world, body[data-view="over"] #world { display: block; }
+body[data-view="list"] #side-list, body[data-view="lobby"] #side-lobby, body[data-view="pick"] #pick, body[data-view="spawn"] #spawn, body[data-view="over"] #over { display: block; }
+body[data-view="over"] #progress { display: block; }
+#progress { display: none; }
+
+.head { position: absolute; top: 0; left: 0; right: 0; display: flex; align-items: center; justify-content: space-between; height: var(--rail); padding: 0 var(--pad); }
+.head .faint { color: var(--ink-3); }
+/* Rows pass under the header once the list is scrolled. At rest a hovered row and a host's frame still cross into it. */
+#list.scrolled .head { z-index: 1; background-color: var(--ground); }
+
+/* ---- the lobby list ---- */
+#list, #lobby { position: absolute; inset: 0; }
+/* M, row becomes room: the rest of the list goes. The view has already changed, so this holds it up while the page fades it. */
+#list.going { display: block; pointer-events: none; }
+#lobbies { position: absolute; inset: 0; padding-top: var(--rail); overflow-y: auto; isolation: isolate; }
+li.lobby {
+  --surface: var(--ground);
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--pad);
+  height: var(--row);
+  padding: 0 var(--pad);
+  background-color: var(--surface);
+}
+li.lobby:nth-child(even) { --surface: var(--sheet-1); }
+li.lobby.dim { color: var(--ink-2); }
+li.lobby.can { cursor: pointer; }
+/* Hover is instant, and the row stands over both neighbours as one solid block */
+li.lobby.can:hover, li.lobby.can:focus-visible {
+  --surface: var(--cream);
+  z-index: 2;
+  height: calc(var(--row) + var(--grow));
+  margin-block: calc(var(--grow) / -2);
+  color: var(--ground);
+  outline: 0;
+}
+li.lobby.can:hover .cap, li.lobby.can:focus-visible .cap { color: var(--on-cream); }
+li.lobby.can:hover .mark, li.lobby.can:focus-visible .mark { background: var(--ground); }
+li.lobby.can:hover .join, li.lobby.can:focus-visible .join { display: flex; }
+/* Watching is not a step toward a match, so its plate is not green */
+li.lobby.watch .join { background: var(--ground); color: var(--cream); }
+li.lobby.can:hover:active { --surface: var(--sheet-3); color: var(--cream); }
+li.lobby.can:hover:active .cap { color: var(--cream); }
+li.lobby.can:hover:active .mark { background: var(--cream); }
+li.lobby.off .avatar img { visibility: hidden; }
+
+.stack { position: relative; z-index: 1; flex: none; width: var(--stack); height: var(--host); --rest: calc(var(--avatar) - var(--overlap)); }
+.stack .avatar, .stack .free {
+  position: absolute;
+  top: calc(50% - var(--avatar) / 2);
+  left: 0;
+  transform: translateX(calc(var(--host) - var(--overlap) + (var(--i) - 1) * var(--rest)));
+  transition: transform 120ms var(--out), scale 200ms var(--out); /* P, the fan. S, a seat arriving */
+  z-index: calc(8 - var(--i));
+}
+.stack .avatar.going { scale: 0; transition: scale 150ms var(--out); /* S */ }
+.stack .avatar.host { top: calc(50% - var(--host) / 2); width: var(--host); height: var(--host); transform: none; z-index: 9; }
+.stack .avatar.host .initial { font-size: calc(var(--host) * .5); }
+.stack .free { top: calc(50% - 2px); width: 4px; height: 4px; margin-left: calc(var(--avatar) / 2 - 2px); background: var(--ink-3); z-index: 0; }
+/* P, the stack spreads to show who it covers. With seven beside the host there is no room to spread, and the row is full anyway. */
+li.lobby.can:hover .stack:not(.packed) .avatar:not(.host), li.lobby.can:focus-visible .stack:not(.packed) .avatar:not(.host) {
+  transform: translateX(calc(var(--host) + 2px + (var(--i) - 1) * var(--fan)));
+}
+/* A face with no picture keeps its letter on the part of the plate the one before it leaves showing */
+.stack .avatar:not(.host) .initial { padding-left: var(--overlap); }
+li.lobby.can:hover .stack:not(.packed) .avatar:not(.host) .initial, li.lobby.can:focus-visible .stack:not(.packed) .avatar:not(.host) .initial { padding-left: 0; }
+
+.about { flex: 1; min-width: 0; }
+.state { display: flex; align-items: center; gap: 8px; margin-bottom: var(--name-gap); }
+.mark { flex: none; display: block; width: 12px; height: 12px; background: var(--cream); clip-path: var(--s-circle); transition: clip-path 280ms var(--move); /* S, what a lobby is doing */ }
+.lobby.countdown .mark, .lobby.preparing .mark { clip-path: var(--s-octagon); }
+.lobby.picking .mark { clip-path: var(--s-square); }
+.lobby.spawning .mark { clip-path: var(--s-diamond); }
+.lobby.running .mark { clip-path: var(--s-hexagon); }
+.lobby.finished .mark { clip-path: var(--s-triangle); }
+.name { display: block; overflow-x: clip; font: 800 var(--t-name)/1 var(--display); text-overflow: ellipsis; text-transform: uppercase; white-space: nowrap; }
+.name.alien { font: 700 calc(var(--t-name) * .72)/calc(1 / .72) var(--text); text-transform: none; }
+.tally { flex: none; display: flex; flex-direction: column; align-items: flex-end; gap: 6px; margin-left: calc(var(--pad) / -4); }
+.tally .cap { color: var(--cream); }
+li.lobby.dim .tally .cap { color: var(--ink-2); }
+.tally .digits { --size: var(--t-name); line-height: 1; }
+.tally .digits i { text-box: normal; }
+.tally .digits b { font-weight: 800; }
+.join { position: absolute; top: 0; right: 0; bottom: 0; display: none; align-items: center; justify-content: center; width: var(--join); background: var(--go); color: var(--ground); font: 700 var(--t-sub)/1 var(--display); letter-spacing: .01em; text-transform: uppercase; }
+#no-lobbies { position: absolute; top: calc(var(--rail) + var(--pad)); left: var(--pad); }
+
+/* ---- faces ---- */
+.avatar { --surface-cut: var(--surface, var(--ground)); position: relative; flex: none; width: var(--avatar); height: var(--avatar); background: var(--sheet-3); outline: 2px solid var(--surface-cut); }
+.avatar .face { display: block; width: 100%; height: 100%; object-fit: cover; }
+.avatar .frame { position: absolute; top: -11%; left: -11%; width: 122%; height: 122%; pointer-events: none; }
+.avatar .initial { display: flex; align-items: center; justify-content: center; width: 100%; height: 100%; background: var(--cream); color: var(--ground); font: 700 calc(var(--size, var(--avatar)) * .5)/1 var(--display); text-transform: uppercase; }
+.lobby.can:hover .avatar .initial, .lobby.can:focus-visible .avatar .initial { background: var(--on-cream); color: var(--cream); }
+
+/* ---- one lobby ---- */
+#seats { position: absolute; top: var(--rail); left: 0; right: 0; }
+li.seat {
+  position: relative;
+  display: grid;
+  grid-template-columns: calc(var(--seat) + var(--seat-gap)) var(--idx) minmax(0, max-content) auto;
+  align-content: center;
+  align-items: start;
+  height: var(--step);
+  padding: 0 var(--pad);
+}
+/* S, someone leaving fades where they were, over the open seat that takes their place */
+li.seat.ghost { position: absolute; inset: 0; pointer-events: none; }
+li.seat:nth-child(1) { z-index: 8; }
+li.seat:nth-child(2) { z-index: 7; }
+li.seat:nth-child(3) { z-index: 6; }
+li.seat:nth-child(4) { z-index: 5; }
+li.seat:nth-child(5) { z-index: 4; }
+li.seat:nth-child(6) { z-index: 3; }
+li.seat:nth-child(7) { z-index: 2; }
+li.seat:nth-child(8) { z-index: 1; }
+li.seat .avatar { --size: var(--seat); position: absolute; top: calc((var(--step) - var(--seat)) / 2); left: var(--pad); width: var(--seat); height: var(--seat); }
+li.seat .idx { grid-column: 2; text-box: trim-both cap alphabetic; }
+li.seat .who { grid-column: 3; min-width: 0; }
+li.seat .nm {
+  display: block;
+  overflow-x: clip;
+  color: var(--cream);
+  font: 800 var(--t-title)/.96 var(--display);
+  text-box: trim-both cap alphabetic;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+  transform-origin: left center;
+  transition: transform 200ms var(--out); /* P, the owner's own call */
+}
+li.seat .nm.small { font-size: var(--t-name); }
+li.seat .nm.alien { font: 700 calc(var(--t-title) * .72)/1 var(--text); text-box: normal; text-transform: none; }
+li.seat .nm.alien.small { font-size: calc(var(--t-name) * .72); }
+li.seat .who:hover .nm { transform: scale(1.06); }
+li.seat .st { grid-column: 4; align-self: center; display: flex; align-items: center; margin-left: var(--state-gap); transition: transform 200ms var(--out); /* P, keeps clear of the name */ }
+li.seat .who:hover + .st { transform: translateX(calc(var(--w, 0px) * .06)); }
+.tag { display: inline-block; padding: 6px 8px; background: var(--go); color: var(--ground); font: 500 var(--t-cap)/1 var(--mono); font-variant-ligatures: none; letter-spacing: .06em; text-transform: uppercase; white-space: nowrap; }
+li.seat.open .cap { color: var(--ink-3); }
+li.seat.open .who { text-box: trim-both cap alphabetic; }
+#side-lobby .cap#drop-title { display: block; margin-bottom: 6px; color: var(--cream); }
+/* A refusal takes the place of what it refuses */
+#drop:has(+ #lobby-note.on) { display: none; }
+
+/* The countdown is one layer: the slot's green rises to fill the sheet, then its top edge drains back down into the slot. The
+   digits are in two copies, black in the green and cream over the bare sheet, and clipping the green clips the black ones with it. */
+#flood { position: absolute; top: 0; left: 0; right: 0; bottom: var(--plate); padding: var(--pad); background: var(--go); clip-path: inset(100% 0 0 0); visibility: hidden; }
+#flood .cap { color: var(--ground); }
+#flood .digits { color: var(--ground); }
+#flood.on { visibility: visible; }
+
+/* ---- the map's screens ---- */
+#world { position: absolute; inset: 0; background: var(--void); }
+#world canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; touch-action: none; cursor: grab; }
+#world canvas:active { cursor: grabbing; }
+
+#room-head { height: calc(var(--facts-top) - var(--pad) - var(--t-cap) - var(--cap-gap)); margin-top: var(--cap-gap); }
+#room-name.tight { font-weight: 700; }
+#pick-hint { margin-top: 6px; }
+#pick.blank #room-name { display: none; }
+#pick.blank #room-facts { visibility: hidden; }
+#pick:not(.blank) #pick-hint { display: none; }
+#room-facts { margin-bottom: var(--pad); min-height: calc(var(--t-cap) * 4 + 24px); }
+#pick-count { display: block; margin-bottom: 6px; }
+#pick-seats li { display: flex; align-items: center; gap: 8px; height: var(--pick-row); }
+/* A player's map colour: a circle while they are still choosing, a square once done */
+.legend { flex: none; display: block; width: 8px; height: 8px; background: var(--seat); }
+.legend.waiting { clip-path: circle(50%); }
+#pick-seats b { flex: 1; min-width: 0; overflow-x: clip; color: var(--cream); font: 700 var(--t-sub)/1 var(--display); letter-spacing: .01em; text-overflow: ellipsis; text-transform: uppercase; white-space: nowrap; }
+#pick-seats b.alien { font: 700 calc(var(--t-sub) * .72)/1 var(--text); text-transform: none; letter-spacing: 0; }
+#pick .note-slide, #spawn .note-slide { bottom: var(--plate); }
+#over .note-slide { bottom: var(--rail); }
+
+.axis { position: relative; width: max-content; margin-top: var(--pad); }
+.axis .cap { position: absolute; top: 0; left: calc(var(--t-tick) + 8px); text-box: trim-both cap alphabetic; }
+#tile-axes { min-height: calc(var(--t-tick) * 1.6 + var(--pad) * 2); }
+#tile-axes.blank .axis { visibility: hidden; }
+#tile-terrain { display: block; margin-top: var(--pad); min-height: var(--t-cap); }
+#spawn-count { display: block; margin-top: 8px; }
+
+#ticks { display: block; margin-top: var(--tick-gap); color: var(--cream); }
+#rate { display: flex; flex-wrap: wrap; gap: 4px 12px; min-height: var(--t-cap); margin-top: 8px; }
+#over-seats { position: absolute; left: 0; right: 0; top: var(--over-top); padding: 0 var(--pad); }
+.player { position: relative; display: flex; align-items: center; gap: 8px; height: var(--live-row); }
+.player .avatar { --size: var(--live-avatar); width: var(--live-avatar); height: var(--live-avatar); outline: 0; }
+.player .about { flex: 1; min-width: 0; }
+.player .line { display: flex; align-items: center; gap: 6px; }
+.player b { min-width: 0; overflow-x: clip; color: var(--ink-2); font: 700 var(--t-sub)/1 var(--display); letter-spacing: .01em; text-overflow: ellipsis; text-transform: uppercase; white-space: nowrap; }
+.player b.alien { font: 700 calc(var(--t-sub) * .72)/calc(1 / .72) var(--text); text-transform: none; letter-spacing: 0; }
+.player small { display: block; overflow: hidden; color: var(--ink-3); font: 500 var(--t-cap)/1 var(--mono); font-variant-ligatures: none; letter-spacing: .06em; text-overflow: ellipsis; text-transform: uppercase; white-space: nowrap; }
+.player.mine b { color: var(--cream); }
+.player.mine small { color: var(--ink-2); }
+
+/* ---- the end, and the sheet that crosses the stage ---- */
+#end {
+  position: absolute;
+  z-index: 4;
+  inset: 0;
+  display: none;
+  padding: var(--pad);
+  background-color: var(--cream);
+  color: var(--ground);
+  transform: translateX(-101%);
+}
+body[data-view="over"] #end { display: block; }
+/* S and M, the largest moment in the product */
+body[data-phase="finished"] #end { transform: none; transition: transform 800ms var(--long); }
+#end .cap { color: var(--on-cream); }
+#end-lead { display: flex; align-items: center; gap: var(--pad); margin-top: var(--pad); min-height: calc(var(--t-tick) * .9); }
+#end-name { min-width: 0; overflow-x: clip; font: 800 var(--t-tick)/.96 var(--display); text-box: trim-both cap alphabetic; text-overflow: ellipsis; text-transform: uppercase; white-space: nowrap; }
+#end-name.alien { font: 700 calc(var(--t-tick) * .72)/1 var(--text); text-box: normal; text-transform: none; }
+#end-name.at-title { font-size: var(--t-title); }
+#end-name.at-name { font-size: var(--t-name); }
+#end-name.alien.at-title { font-size: calc(var(--t-title) * .72); }
+#end-name.alien.at-name { font-size: calc(var(--t-name) * .72); }
+#end .tag { flex: none; }
+#end-rows { margin-top: var(--pad); }
+#end-rows li { display: flex; align-items: baseline; gap: var(--pad); padding: 6px 0; color: var(--on-cream); }
+#end-rows b { min-width: 0; overflow-x: clip; font: 700 var(--t-sub)/1 var(--display); letter-spacing: .01em; text-overflow: ellipsis; text-transform: uppercase; white-space: nowrap; }
+#end-rows b.alien { font: 700 calc(var(--t-sub) * .72)/calc(1 / .72) var(--text); text-transform: none; letter-spacing: 0; }
+#end-rows .cap { flex: none; }
+#end-when { display: block; margin-top: var(--pad); }
+/* M, the masked type after the sheet lands */
+body[data-phase="finished"] #end .reveal { animation: reveal 200ms var(--out) 800ms backwards; }
+@keyframes reveal { from { clip-path: inset(0 100% 0 0); } to { clip-path: inset(0 0 0 0); } }
+
+/* M, a straight flat sheet crossing the stage. Only its transform moves, above a live canvas. */
+#sheet { position: absolute; z-index: 5; inset: 0; background-color: var(--cream); transform: translateX(-101%); visibility: hidden; pointer-events: none; }
+#sheet.cross { transform: translateX(101%); visibility: visible; transition: transform 800ms var(--long); }
+
+/* Where your decision is: four corners, each moved by transform alone, each arm scaled only along its length so its thickness
+   holds. Every move retargets from wherever it is, and on the map positions are written straight, after each camera change. */
+#bracket { position: absolute; z-index: 6; inset: 0; pointer-events: none; }
+#bracket .c { position: absolute; top: 0; left: 0; }
+#bracket i { position: absolute; display: block; background: var(--cream); }
+#bracket.shut i { background: var(--go); }
+#bracket .h { width: 1px; height: var(--b); }
+#bracket .v { width: var(--b); height: 1px; }
+#bracket .tl .h, #bracket .tl .v { top: 0; left: 0; transform-origin: 0 0; }
+#bracket .tr .h { top: 0; left: -1px; transform-origin: 100% 0; }
+#bracket .tr .v { top: 0; left: calc(var(--b) * -1); transform-origin: 0 0; }
+#bracket .bl .h { top: calc(var(--b) * -1); left: 0; transform-origin: 0 0; }
+#bracket .bl .v { top: -1px; left: 0; transform-origin: 0 100%; }
+#bracket .br .h { top: calc(var(--b) * -1); left: -1px; transform-origin: 100% 0; }
+#bracket .br .v { top: -1px; left: calc(var(--b) * -1); transform-origin: 0 100%; }
+#bracket[data-t="fly"] .c, #bracket[data-t="fly"] i { transition: transform 360ms var(--move), background-color 360ms var(--move); /* M, lands on your seat */ }
+#bracket[data-t="room"] .c, #bracket[data-t="room"] i { transition: transform 120ms var(--move), background-color 120ms var(--move); /* P, to the room you clicked */ }
+#bracket[data-t="tile"] .c, #bracket[data-t="tile"] i { transition: transform 160ms var(--move), background-color 160ms var(--move); /* P, to the tile you clicked */ }
+#bracket[data-t="shut"] .c, #bracket[data-t="shut"] i { transition: transform 160ms var(--move), background-color 160ms var(--move); /* P, ready, lock in, place */ }
+#bracket[data-t="open"] .c, #bracket[data-t="open"] i { transition: transform 120ms var(--out), background-color 120ms var(--out); /* P, reversible mid-flight */ }
+#bracket[data-t="scale"] .c, #bracket[data-t="scale"] i { transition: transform 200ms var(--out); /* P, keeps round a scaled name */ }
+#bracket[data-t="leave"] .c { transition: transform 280ms var(--leave); /* M, nothing is left to decide */ }
+
+/* What the keyboard starts lands at once. Only a hold's fill takes time, because the fill is the countdown itself. */
+html[data-keys] #block,
+html[data-keys] #settings,
+html[data-keys] #plate,
+html[data-keys] #stop-plate,
+html[data-keys] .hold,
+html[data-keys] .plate,
+html[data-keys] .stack .avatar { transition: none; }
+
+/* Animations off, or the system asks for less: movement goes, while colour, opacity, fills and holds stay. Less, not none. */
+html[data-calm] #block,
+html[data-calm] .stack .avatar,
+html[data-calm] #plate,
+html[data-calm] #stop-plate,
+html[data-calm] .note-slide .note,
+html[data-calm] li.seat .nm,
+html[data-calm] li.seat .st { transition-property: none; }
+html[data-calm] .hold, html[data-calm] .plate { transition: none; }
+html[data-calm] #settings { transition: opacity 160ms linear, visibility 0s; transform: none; }
+html[data-calm] #bracket .c { transition: none; }
+html[data-calm] #plate, html[data-calm] #stop-plate { transition: opacity 160ms linear, visibility 0s; opacity: 0; transform: none; }
+html[data-calm] #plate.on, html[data-calm] #stop-plate.on { opacity: 1; }
+html[data-calm] #end { opacity: 0; transform: none; pointer-events: none; }
+html[data-calm] body[data-phase="finished"] #end { opacity: 1; pointer-events: auto; transition: opacity 160ms linear; }
+html[data-calm] #sheet { display: none; }
+html[data-calm] #end .reveal { animation: none; }
+</style>
+<script>
+// Before the first paint, so the sheets never show without their grain, and motion settings hold from the first frame.
+try { if (JSON.parse(localStorage.getItem('krebs.prefs'))?.animations === false) document.documentElement.setAttribute('data-calm', ''); } catch {}
+if (matchMedia('(prefers-reduced-motion: reduce)').matches) document.documentElement.setAttribute('data-calm', '');
+</script>
+</head>
+<body data-view="list">
+
+<main id="stage" class="paper">
+  <div id="world"><canvas id="cv"></canvas></div>
+
+  <section id="list">
+    <header class="head"><span class="cap">Lobbies on this server</span><span class="cap faint" id="list-keys" hidden>&#8593;&#8595; Enter</span></header>
+    <ul id="lobbies"></ul>
+    <p class="title" id="no-lobbies" hidden>No lobbies yet</p>
+  </section>
+
+  <section id="lobby">
+    <header class="head"><span class="cap" id="lobby-name"></span></header>
+    <ol id="seats"></ol>
+  </section>
+
+  <section id="end" class="paper">
+    <p class="cap reveal" id="end-tick"></p>
+    <div id="end-lead" class="reveal"><span id="end-name"></span><span class="tag" id="end-tag">Leading</span></div>
+    <ol id="end-rows" class="reveal"></ol>
+    <p class="cap reveal" id="end-when">At last tick</p>
+  </section>
+
+  <div id="sheet" class="paper"></div>
+
+  <div id="bracket" data-t="none" hidden>
+    <div class="c tl"><i class="h"></i><i class="v"></i></div>
+    <div class="c tr"><i class="h"></i><i class="v"></i></div>
+    <div class="c bl"><i class="h"></i><i class="v"></i></div>
+    <div class="c br"><i class="h"></i><i class="v"></i></div>
+  </div>
+</main>
+
+<aside id="panel">
+  <div id="progress"></div>
+  <div id="front" class="paper">
+    <section class="side" id="side-list">
+      <p class="cap">Open lobbies</p>
+      <div class="digits mass" id="open-count"></div>
+      <dl class="read">
+        <dt>Starting</dt><dd id="n-starting"></dd>
+        <dt>Running</dt><dd id="n-running"></dd>
+        <dt>Players</dt><dd id="n-players"></dd>
+      </dl>
+      <p class="note" id="list-note" style="margin-top:var(--pad)"></p>
+    </section>
+
+    <section class="side" id="side-lobby">
+      <p class="cap" id="count-word"></p>
+      <div class="digits mass" id="count"></div>
+      <div id="drop">
+        <span class="cap" id="drop-title"></span>
+        <p class="text" id="drop-note"></p>
+      </div>
+      <p class="note" id="lobby-note"></p>
+      <div id="flood">
+        <p class="cap">Starting in</p>
+        <div class="digits mass" id="count-green" aria-hidden="true"></div>
+      </div>
+    </section>
+
+    <section class="side" id="pick">
+      <p class="cap">Room</p>
+      <div id="room-head">
+        <h2 class="title" id="room-name"></h2>
+        <p class="text" id="pick-hint">Click a lit room, then lock it in. Drag to move, scroll to zoom.</p>
+      </div>
+      <dl class="read" id="room-facts">
+        <dt>Sources</dt><dd id="f-sources"></dd>
+        <dt>Mineral</dt><dd id="f-mineral"></dd>
+        <dt>Plain</dt><dd id="f-plain"></dd>
+        <dt>Swamp</dt><dd id="f-swamp"></dd>
+      </dl>
+      <span class="cap" id="pick-count"></span>
+      <ul id="pick-seats"></ul>
+      <div class="note-slide"><p class="note" id="pick-note"></p></div>
+    </section>
+
+    <section class="side" id="spawn">
+      <p class="cap">Tile</p>
+      <div id="tile-axes" class="blank">
+        <div class="axis"><div class="digits tick" id="tile-x" style="margin-top:0"></div><span class="cap">X</span></div>
+        <div class="axis"><div class="digits tick" id="tile-y" style="margin-top:0"></div><span class="cap">Y</span></div>
+      </div>
+      <span class="cap" id="tile-terrain"></span>
+      <span class="cap" id="spawn-count"></span>
+      <div class="note-slide"><p class="note" id="spawn-note"></p></div>
+    </section>
+
+    <section class="side" id="over">
+      <p class="cap">Tick</p>
+      <div class="digits tick" id="thousands"></div>
+      <span class="cap" id="ticks"></span>
+      <p class="cap" id="rate"><span></span><span></span></p>
+      <ol id="over-seats"></ol>
+      <div class="note-slide"><p class="note" id="over-note"></p></div>
+    </section>
+
+    <button class="plate" id="new-lobby" data-tone="line" type="button" hidden>New lobby</button>
+    <button class="plate" id="slot" type="button" hidden><span class="cap" id="slot-sub" hidden></span><span id="slot-label"></span></button>
+    <button class="hold" id="stop" type="button" hidden><span class="lab">Stop match</span><span class="fill" aria-hidden="true">Stop match</span></button>
+    <div id="stop-clip"><div id="stop-plate"></div></div>
+    <div id="drop-sheet">Drop</div>
+  </div>
+</aside>
+
+<nav id="rail" class="paper" aria-label="Match">
+  <div class="mod" id="mark" role="img" aria-label="Krebs"></div>
+  <div id="block"></div>
+  <ol id="stages">
+    <li class="mod" data-n="1"><span class="n">01</span><span class="w">List</span><button class="hold" id="back" type="button" hidden><span class="lab"></span><span class="fill" aria-hidden="true"></span></button></li>
+    <li class="mod" data-n="2"><span class="n">02</span><span class="w">Lobby</span></li>
+    <li class="mod" data-n="3"><span class="n">03</span><span class="w">Pick</span></li>
+    <li class="mod" data-n="4"><span class="n">04</span><span class="w">Spawn</span></li>
+    <li class="mod" data-n="5"><span class="n">05</span><span class="w">Live</span></li>
+  </ol>
+  <div id="server"><span id="server-name"></span></div>
+  <button class="mod" id="you" type="button" hidden></button>
+  <div class="mod" id="leave-mod"><button class="hold" id="leave" type="button"><span class="lab">Leave<br>server</span><span class="fill" aria-hidden="true">Leave<br>server</span></button></div>
+</nav>
+
+<div id="plate-clip"><div id="plate"></div></div>
+
+<div id="settings">
+  <b id="set-name"></b>
+  <button id="set-anim" type="button"><span class="cap"></span></button>
+  <button id="set-move" type="button"><span class="cap"></span></button>
+</div>
+
+<input id="folder" type="file" webkitdirectory hidden>
+
+<script src="/assets/render.js"></script>
+<script src="/assets/worldmap.js"></script>
+<script type="module" src="/assets/landing.js"></script>
+</body>
+</html>

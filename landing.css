@@ -1,0 +1,26 @@
+/* The landing page in the client, while the world view is off. Added after bare.css, see WORLD_VIEW in src/lib.rs.
+   The page itself is landing.html: it runs in a frame of its own, so it can be an ordinary web page. */
+
+/* Covers everything but Exit server, so the client's own pages never show, first-run name screen included. */
+app-menu li.bare-landing iframe {
+  position: fixed;
+  z-index: 1;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  border: 0;
+  background: #0C0B09;
+  pointer-events: auto;
+}
+
+/* Not on the client's server list, which is where Exit server leads. */
+app-menu:has(~ app-nw-menu) li.bare-landing { display: none !important; }
+
+app-menu li.bare-exit-old {
+  z-index: 2;
+  top: auto !important;
+  right: 24px;
+  bottom: 16px;
+  left: auto;
+}
