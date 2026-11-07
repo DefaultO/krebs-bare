@@ -1,16 +1,39 @@
 //! One match's own server: a `krebs serve` child process with a world made for that match, driven over its HTTP API.
 //! `child.pid` in a match's folder names the running child: a child outlives a server that is killed, so the next start
 //! ends whatever those files still name.
+//!
+//! A child listens on this PC only, but any program here or any web page in a browser here can find its port. So every
+//! call needs a secret made for that match, its server password, and it has no admin console. Past that password
+//! `/api/version` says how many have placed a spawn, `/assets/map` is terrain the players already have, and `/socket` gives
+//! nothing to a connection with no token, and only a sign-in makes one.
+//!
+//! What goes between a server and its child goes through the pipes between them and never through the match's folder,
+//! which on some PCs other accounts can write to: the secret goes down the child's stdin, and the port comes back up its
+//! stdout, with the rest of what it prints going on to `server.log`. Nothing else can stand in for either. The child waits
+//! for the secret before it does anything, which is also the moment it goes under its memory limit (`job`).
 
+use crate::job::Job;
+use crate::window;
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Read, Write};
+use std::fs::File;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::mpsc::{channel, Sender};
+use std::thread::JoinHandle;
+use std::time::Duration;
 use util::json::Json;
 
 const PID_FILE: &str = "child.pid";
+/// What a child with `--announce-port` puts before its port, on a line of its own. It takes any free one and says so, as a
+/// port picked here for it to use could be taken in between, and whatever took it would be sent the secret.
+const PORT_LINE: &[u8] = b"krebs-port ";
+/// How long a child gets to come up, with its world to load.
+const START_TIME: Duration = Duration::from_secs(120);
+/// On this PC alone, on any free port, with no admin console and no Steam sign-in.
+const CHILD_FLAGS: [&str; 14] = ["--host", "127.0.0.1", "--port", "0", "--cli-port", "0", "--steam", "off", "--tick-rate", "50", "--mods", "devtools,matchrun", "--password-stdin", "--announce-port"];
+const SECRET_BYTES: usize = 32;
 const ROOMS_PER_SECTOR: u32 = 72;
 const ROOMS_PER_PLAYER: u32 = 12;
 const SPAWN_NAME: &str = "Spawn1";
@@ -37,12 +60,14 @@ pub(crate) struct Map {
 #[derive(Clone)]
 pub(crate) struct Link {
     port: u16,
+    /// The match's server password.
+    secret: String,
 }
 
 #[cfg(test)]
 impl Link {
     pub(crate) fn nowhere() -> Link {
-        Link { port: 0 }
+        Link { port: 0, secret: String::new() }
     }
 }
 
@@ -50,6 +75,10 @@ pub(crate) struct World {
     process: Child,
     dir: PathBuf,
     pub link: Link,
+    /// None only until the child is under it.
+    job: Option<Job>,
+    /// Takes what the child prints, until it ends.
+    printing: Option<JoinHandle<()>>,
 }
 
 /// The map's side in sectors, for this many players.
@@ -82,9 +111,10 @@ fn read_objects(db: &Json) -> BTreeMap<String, Vec<(String, i32, i32, Option<Str
     objects
 }
 
-fn free_port() -> Result<u16, String> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
-    Ok(listener.local_addr().map_err(|e| e.to_string())?.port())
+pub(crate) fn random_hex(bytes: usize) -> String {
+    let mut raw = vec![0u8; bytes];
+    util::sys::os_random(&mut raw);
+    raw.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn run(exe: &Path, what: &str, dir: &Path, args: &[&std::ffi::OsStr]) -> Result<(), String> {
@@ -95,20 +125,42 @@ fn run(exe: &Path, what: &str, dir: &Path, args: &[&std::ffi::OsStr]) -> Result<
     Err(format!("{what} failed: {}", String::from_utf8_lossy(&out.stderr)))
 }
 
-/// A match's own `krebs.json`.
+/// A match's own `krebs.json`, which holds nothing secret and nothing that keeps anyone out: on some PCs others can change
+/// it, so what does that is in `CHILD_FLAGS`, which go before any file.
 fn child_config() -> Json {
     backend::http::obj(vec![
-        ("auth", backend::http::obj(vec![("steam", Json::Str("off".into()))])),
+        ("cli", backend::http::obj(vec![("off", Json::Bool(true))])),
         ("persist", backend::http::obj(vec![("intervalS", Json::Num(NO_CHECKPOINTS_S))])),
         ("engine", backend::http::obj(vec![("cpuMaxPerTick", Json::Num(CPU_MAX_PER_TICK))])),
         ("runner", backend::http::obj(vec![("semiSpaceMb", Json::Num(SEMI_SPACE_MB)), ("setupList", Json::Bool(true))])),
     ])
 }
 
+/// The port in a line a child printed, if that is what it is.
+fn announced(line: &[u8]) -> Option<u16> {
+    std::str::from_utf8(line.strip_prefix(PORT_LINE)?).ok()?.trim().parse().ok()
+}
+
+/// Sends on the port a child announces, once, and writes everything else it prints to `log`, until it ends.
+fn follow(printed: ChildStdout, mut log: File, port: Sender<u16>) {
+    let mut lines = BufReader::new(printed);
+    let mut line = Vec::new();
+    while lines.read_until(b'\n', &mut line).is_ok_and(|read| read > 0) {
+        if let Some(found) = announced(&line) {
+            let _ = port.send(found);
+            break;
+        }
+        let _ = log.write_all(&line);
+        line.clear();
+    }
+    let _ = std::io::copy(&mut lines, &mut log);
+}
+
 impl World {
-    /// Generates a world in `dir` and serves it at 50 ms a tick: a paused world would apply commands but never publish
-    /// them, so accounts made while it was paused could not sign in, and ticks cost nothing before anyone has a bot.
-    pub fn start(dir: &Path, sectors: u32, seed: u64) -> Result<(World, Map), String> {
+    /// Generates a world in `dir` and serves it at 50 ms a tick, on no more than `memory` bytes: a paused world would apply
+    /// commands but never publish them, so accounts made while it was paused could not sign in, and ticks cost nothing before
+    /// anyone has a bot.
+    pub fn start(dir: &Path, sectors: u32, seed: u64, memory: u64) -> Result<(World, Map), String> {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
         // the child runs in `dir`, and `--data` is relative when the server's is
         let dir = std::path::absolute(dir).map_err(|e| e.to_string())?;
@@ -127,32 +179,34 @@ impl World {
         rooms.sort();
         let claimable = objects.iter().filter(|(_, list)| list.iter().any(|(kind, ..)| kind == "controller")).map(|(room, _)| room.clone()).collect();
 
-        let (port, cli_port) = (free_port()?, free_port()?);
         let config = dir.join("krebs.json");
         std::fs::write(&config, child_config().stringify()).map_err(|e| e.to_string())?;
-        let log = std::fs::File::create(dir.join("server.log")).map_err(|e| e.to_string())?;
-        let process = Command::new(&exe)
+        let log = File::create(dir.join("server.log")).map_err(|e| e.to_string())?;
+        let mut process = Command::new(&exe)
             .arg("serve")
             .arg("--config")
             .arg(&config)
             .arg("--data")
             .arg(&data)
-            .args(["--port", &port.to_string(), "--cli-port", &cli_port.to_string(), "--tick-rate", "50", "--mods", "devtools,matchrun"])
+            .args(CHILD_FLAGS)
             .current_dir(&dir)
-            .stdin(Stdio::null())
-            .stdout(log.try_clone().map_err(|e| e.to_string())?)
-            .stderr(log)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(log.try_clone().map_err(|e| e.to_string())?)
             .spawn()
             .map_err(|e| e.to_string())?;
-        let mut world = World { process, dir, link: Link { port } };
+        let (Some(mut password), Some(printed)) = (process.stdin.take(), process.stdout.take()) else { return Err("the match server has no pipes".into()) };
+        let (told, port) = channel();
+        let printing = std::thread::Builder::new().name("match output".into()).spawn(move || follow(printed, log, told)).map_err(|e| e.to_string())?;
+        let secret = random_hex(SECRET_BYTES);
+        let mut world = World { process, dir, link: Link { port: 0, secret }, job: None, printing: Some(printing) };
         std::fs::write(world.dir.join(PID_FILE), world.process.id().to_string()).map_err(|e| e.to_string())?;
-        let deadline = Instant::now() + Duration::from_secs(120);
-        while world.link.http("GET", "/api/version", None, None).is_err() {
-            if Instant::now() > deadline || world.exited() {
-                return Err("the match server did not start".into());
-            }
-            std::thread::sleep(Duration::from_millis(200));
-        }
+        // it waits for the password, so it does this under the limit and before anything of a bot's can run
+        world.job = Some(Job::limit(&world.process, memory).map_err(|e| format!("the memory limit could not be set: {e}"))?);
+        password.write_all(format!("{}\n", world.link.secret).as_bytes()).map_err(|_| "the match server did not start")?;
+        drop(password);
+        // with the child gone this comes back at once, as `follow` lets go of the sender
+        world.link.port = port.recv_timeout(START_TIME).map_err(|_| "the match server did not start")?;
         let terrain = world.link.terrain(&rooms)?;
         Ok((world, Map { rooms, claimable, terrain, objects }))
     }
@@ -162,9 +216,18 @@ impl World {
         matches!(self.process.try_wait(), Ok(Some(_)))
     }
 
+    /// Whether the child has asked for more memory than its limit.
+    pub fn over_memory(&mut self) -> bool {
+        self.job.as_mut().is_some_and(Job::over_limit)
+    }
+
     fn stop(&mut self) {
         let _ = self.process.kill();
         let _ = self.process.wait();
+        // `server.log` is open until this has seen the end of the child's output
+        if let Some(printing) = self.printing.take() {
+            let _ = printing.join();
+        }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -186,7 +249,7 @@ impl Link {
         let mut s = TcpStream::connect(("127.0.0.1", self.port)).map_err(|e| e.to_string())?;
         s.set_read_timeout(Some(Duration::from_secs(30))).map_err(|e| e.to_string())?;
         let body = body.unwrap_or("");
-        let mut req = format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n");
+        let mut req = format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nX-Server-Password: {}\r\n", self.secret);
         if let Some(t) = token {
             req += &format!("X-Token: {t}\r\nX-Username: x\r\n");
         }
@@ -271,16 +334,31 @@ impl Link {
 
 // ---- children left behind ----
 
+/// The folder after `--data` in a command line, which is quoted if it holds a space.
+fn data_of(command_line: &str) -> Option<&str> {
+    let rest = command_line.split_once(" --data ")?.1.trim_start();
+    Some(match rest.strip_prefix('"') {
+        Some(quoted) => quoted.split('"').next()?,
+        None => rest.split(" --").next()?.trim_end(),
+    })
+}
+
 /// A pid file can outlive its process, and after a reboot the number can belong to anything, so nothing is killed on the
-/// number alone.
+/// number alone. The whole folder has to match: a copy of a running server's folder holds that server's `child.pid`, and
+/// any relative path of it is part of that child's command line too. A child is always started with its absolute path.
 fn is_child_of(command_line: &str, folder: &Path) -> bool {
-    command_line.contains("serve") && command_line.contains(folder.join("world").to_string_lossy().as_ref())
+    let Ok(folder) = std::path::absolute(folder) else { return false };
+    let world = folder.join("world");
+    // Windows does not mind the case of a path, and the data folder can be named differently from one start to the next
+    let same = |a: &str, b: &str| if cfg!(windows) { a.to_lowercase() == b.to_lowercase() } else { a == b };
+    command_line.contains(" serve ") && data_of(command_line).is_some_and(|data| same(data, &world.to_string_lossy()))
 }
 
 #[cfg(windows)]
 fn command_line(pid: u32) -> Option<String> {
     let script = format!("(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CommandLine");
-    let out = Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &script]).output().ok()?;
+    let powershell = backend::steam_web::system_program(r"WindowsPowerShell\v1.0\powershell");
+    let out = Command::new(powershell).args(["-NoProfile", "-NonInteractive", "-Command", &script]).output().ok()?;
     Some(String::from_utf8_lossy(&out.stdout).to_string()).filter(|s| !s.trim().is_empty())
 }
 
@@ -292,7 +370,7 @@ fn command_line(pid: u32) -> Option<String> {
 
 #[cfg(windows)]
 fn kill(pid: u32) {
-    let _ = Command::new("taskkill").args(["/PID", &pid.to_string(), "/F"]).output();
+    let _ = Command::new(backend::steam_web::system_program("taskkill")).args(["/PID", &pid.to_string(), "/F"]).output();
 }
 
 #[cfg(not(windows))]
@@ -300,12 +378,29 @@ fn kill(pid: u32) {
     let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
 }
 
+/// Whether `data\bare\matches` leads somewhere other than where it says. std counts a junction as a symlink. A cloud
+/// drive's placeholder is a reparse point too, but no link, and Documents is often on one, so what only stands for itself
+/// is fine. The data folder is the host's to place, so the two steps below it are what is looked at.
+pub(crate) fn redirected(matches: &Path) -> bool {
+    matches.ancestors().take(2).any(|step| std::fs::symlink_metadata(step).is_ok_and(|found| found.file_type().is_symlink()))
+}
+
+/// Match folders are named by the lobby's number, so nothing else here is one of ours.
+fn is_match_folder(folder: &Path) -> bool {
+    let name = folder.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()) && std::fs::symlink_metadata(folder).is_ok_and(|found| found.is_dir())
+}
+
 /// Ends the worlds a previous server left running and clears their folders: lobbies live in memory, so those are lost.
 pub(crate) fn sweep(matches: &Path) {
-    for folder in std::fs::read_dir(matches).into_iter().flatten().flatten().map(|f| f.path()) {
+    if redirected(matches) {
+        window::warn(format!("bare: {} is a link to another folder, so nothing in it was cleared, and matches cannot start until it is gone.", matches.display()));
+        return;
+    }
+    for folder in std::fs::read_dir(matches).into_iter().flatten().flatten().map(|f| f.path()).filter(|f| is_match_folder(f)) {
         if let Some(pid) = std::fs::read_to_string(folder.join(PID_FILE)).ok().and_then(|t| t.trim().parse::<u32>().ok()) {
             if pid != std::process::id() && command_line(pid).is_some_and(|c| is_child_of(&c, &folder)) {
-                eprintln!("bare: ending {pid}, a match server left over from the last run");
+                window::warn(format!("bare: ending {pid}, a match server left over from the last run"));
                 kill(pid);
                 std::thread::sleep(Duration::from_millis(500));
             }
@@ -344,10 +439,172 @@ mod tests {
     }
 
     #[test]
+    fn a_matchs_settings_hold_no_secret_and_it_has_no_console_or_fixed_port() {
+        let config = child_config();
+        assert!(config.get("http").is_none(), "a port or a password here would be for anyone who can change this file to set");
+        assert_eq!(config.get("cli").unwrap().get("off").and_then(Json::as_bool), Some(true));
+        assert!(CHILD_FLAGS.windows(2).any(|pair| pair == ["--host", "127.0.0.1"]) && CHILD_FLAGS.windows(2).any(|pair| pair == ["--port", "0"]));
+        assert!(CHILD_FLAGS.windows(2).any(|pair| pair == ["--cli-port", "0"]) && CHILD_FLAGS.contains(&"--password-stdin"));
+        assert_ne!(random_hex(SECRET_BYTES), random_hex(SECRET_BYTES));
+        assert_eq!(random_hex(SECRET_BYTES).len(), SECRET_BYTES * 2);
+    }
+
+    #[test]
+    fn only_the_line_for_it_gives_a_port() {
+        assert_eq!(announced(b"krebs-port 21555\n"), Some(21555));
+        assert_eq!(announced(b"krebs-port 21555\r\n"), Some(21555));
+        assert_eq!(announced(b"krebs 0.2.1 serving 100 rooms on http://127.0.0.1:21555 (tick rate 50 ms)\n"), None);
+        for line in ["krebs-port \n", "krebs-port 70000\n", "krebs-port x\n", " krebs-port 1\n", ""] {
+            assert_eq!(announced(line.as_bytes()), None, "{line:?}");
+        }
+    }
+
+    /// One answer, and what was asked to get it.
+    fn answer_once(reply: &'static str) -> (u16, std::thread::JoinHandle<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let asked = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buffer = [0u8; 1024];
+            let n = s.read(&mut buffer).unwrap();
+            s.write_all(reply.as_bytes()).unwrap();
+            String::from_utf8_lossy(&buffer[..n]).to_string()
+        });
+        (port, asked)
+    }
+
+    #[test]
+    fn every_call_to_a_match_carries_its_password() {
+        let (port, asked) = answer_once("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{}");
+        Link { port, secret: "s3cret".into() }.text("GET", "/api/version", None, None).unwrap();
+        assert!(asked.join().unwrap().contains("\r\nX-Server-Password: s3cret\r\n"));
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("krebs-sweep-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_sweep_clears_match_folders_and_nothing_else() {
+        let dir = scratch("names");
+        let matches = dir.join("bare").join("matches");
+        for name in ["7", "12", "notes", "7a"] {
+            std::fs::create_dir_all(matches.join(name)).unwrap();
+        }
+        std::fs::write(matches.join("3"), "a file, not a folder").unwrap();
+        sweep(&matches);
+        let mut left: Vec<String> = std::fs::read_dir(&matches).unwrap().map(|f| f.unwrap().file_name().to_string_lossy().to_string()).collect();
+        left.sort();
+        assert_eq!(left, ["3", "7a", "notes"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plain_folders_are_not_links() {
+        let dir = scratch("plain");
+        let matches = dir.join("bare").join("matches");
+        assert!(!redirected(&matches), "not made yet is fine");
+        std::fs::create_dir_all(&matches).unwrap();
+        assert!(!redirected(&matches));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    fn junction(link: &Path, target: &Path) {
+        let made = Command::new(backend::steam_web::system_program("cmd")).arg("/c").arg("mklink").arg("/J").arg(link).arg(target).output().unwrap();
+        assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stdout));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_sweep_stays_out_of_a_junction_at_either_step() {
+        for step in ["matches", "bare"] {
+            let dir = scratch(step);
+            let elsewhere = dir.join("elsewhere");
+            std::fs::create_dir_all(elsewhere.join("matches").join("1")).unwrap();
+            std::fs::create_dir_all(elsewhere.join("1")).unwrap();
+            let bare = dir.join("bare");
+            if step == "bare" {
+                junction(&bare, &elsewhere);
+            } else {
+                std::fs::create_dir_all(&bare).unwrap();
+                junction(&bare.join("matches"), &elsewhere);
+            }
+            let matches = bare.join("matches");
+            assert!(redirected(&matches), "{step}");
+            sweep(&matches);
+            assert!(elsewhere.join("1").is_dir() && elsewhere.join("matches").join("1").is_dir(), "{step}: nothing behind it went");
+            let _ = std::fs::remove_dir(if step == "bare" { &bare } else { &matches });
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_named_like_a_match_is_not_cleared_through() {
+        let dir = scratch("entry");
+        let matches = dir.join("matches");
+        std::fs::create_dir_all(&matches).unwrap();
+        std::fs::create_dir_all(dir.join("elsewhere").join("keep")).unwrap();
+        junction(&matches.join("5"), &dir.join("elsewhere"));
+        assert!(!redirected(&matches));
+        sweep(&matches);
+        assert!(dir.join("elsewhere").join("keep").is_dir());
+        let _ = std::fs::remove_dir(matches.join("5"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn only_a_match_of_ours_is_ended() {
         let folder = Path::new("data").join("bare").join("matches").join("3");
-        let line = format!("krebs.exe serve --data {}", folder.join("world").display());
-        assert!(is_child_of(&line, &folder));
+        let world = std::path::absolute(&folder).unwrap().join("world");
+        let line = |data: &Path| format!(r#""C:\k\krebs.exe" serve --config x --data {} --tick-rate 50"#, data.display());
+        assert!(is_child_of(&line(&world), &folder));
+        assert!(is_child_of(&format!("{}\r\n", line(&world)), &folder), "as PowerShell gives it");
+        assert!(is_child_of(&format!(r#"krebs.exe serve --data "{}" --tick-rate 50"#, world.display()), &folder), "a space in a folder gets it quoted");
         assert!(!is_child_of("notepad.exe", &folder));
+        assert!(!is_child_of(&line(&Path::new("data").join("bare").join("matches").join("3").join("world")), &folder), "a child is told the whole path");
+        assert!(!is_child_of(&line(&world).replace(" serve ", " export "), &folder));
+    }
+
+    #[test]
+    fn a_copy_of_a_folder_leaves_the_first_ones_match_alone() {
+        // the match in the first server's folder, and what the sweep of a copy of that folder looks at
+        let copied = std::path::absolute(Path::new("copy")).unwrap().join("data").join("bare").join("matches").join("1");
+        let first = std::path::absolute(Path::new("first")).unwrap().join("data").join("bare").join("matches").join("1").join("world");
+        let line = format!("krebs.exe serve --config x --data {} --tick-rate 50 --mods devtools,matchrun", first.display());
+        assert!(!is_child_of(&line, &copied));
+        assert!(!is_child_of(&line, Path::new("data").join("bare").join("matches").join("1").as_path()), "nor a relative data folder");
+        let inside = std::path::absolute(Path::new("first")).unwrap().join("old").join("first");
+        let deeper = format!("krebs.exe serve --data {}{}world --tick-rate 50", inside.display(), std::path::MAIN_SEPARATOR);
+        assert!(!is_child_of(&deeper, Path::new("first")), "part of a path is not the path");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_case_of_a_folder_does_not_hide_a_leftover() {
+        let folder = std::path::absolute(Path::new("Data")).unwrap().join("Matches").join("3");
+        let line = format!("krebs.exe serve --data {} --tick-rate 50", folder.join("world").display().to_string().to_uppercase());
+        assert!(is_child_of(&line, &folder));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn what_a_child_prints_goes_to_its_log_but_for_the_port() {
+        let dir = scratch("follow");
+        let log = dir.join("server.log");
+        let print = |text: &str| format!("echo {text}");
+        let script = [print("loaded a world"), print("krebs-port 21555"), print("krebs-port 1"), print("serving")].join("& ");
+        let mut child = Command::new(backend::steam_web::system_program("cmd")).args(["/c", &script]).stdout(Stdio::piped()).spawn().unwrap();
+        let (told, port) = channel();
+        follow(child.stdout.take().unwrap(), File::create(&log).unwrap(), told);
+        let _ = child.wait();
+        assert_eq!(port.iter().collect::<Vec<_>>(), [21555], "once");
+        let said = std::fs::read_to_string(&log).unwrap();
+        assert!(said.contains("loaded a world") && said.contains("krebs-port 1") && said.contains("serving") && !said.contains("21555"), "{said}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

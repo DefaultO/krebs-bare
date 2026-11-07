@@ -322,8 +322,8 @@ i { font-style: normal; }
 .plate[data-tone="done"]:active { transform: none; }
 .plate:focus-visible { outline: 2px solid var(--ground); outline-offset: -5px; }
 .plate[data-tone="line"]:focus-visible, .plate[data-tone="done"]:focus-visible { outline: 2px solid var(--cream); outline-offset: -5px; }
-#new-lobby { bottom: var(--plate); height: var(--rail); font: 700 var(--t-sub)/1 var(--display); letter-spacing: .01em; }
-body:not([data-view="list"]) #new-lobby, body:not([data-view="over"]) #stop { display: none; }
+#give-up { bottom: var(--plate); height: var(--rail); font: 700 var(--t-sub)/1 var(--display); letter-spacing: .01em; }
+body:not([data-view="list"]) #give-up, body:not([data-view="over"]) #stop { display: none; }
 #stop { position: absolute; left: 0; right: 0; bottom: 0; height: var(--rail); color: var(--ink-2); font: 700 var(--t-sub)/1 var(--display); letter-spacing: .01em; text-transform: uppercase; outline: var(--ring) solid var(--ink-3); outline-offset: calc(var(--ring) * -1); }
 #stop .lab, #stop .fill { justify-content: flex-start; padding: 0 var(--pad); }
 #stop-clip { position: absolute; left: 0; right: 0; bottom: var(--rail); overflow: hidden; pointer-events: none; }
@@ -333,7 +333,7 @@ body:not([data-view="list"]) #new-lobby, body:not([data-view="over"]) #stop { di
 /* Dragging a folder over the window: the front sheet flips, and the slot stands aside */
 #drop-sheet { position: absolute; inset: 0; display: none; align-items: flex-start; padding: var(--pad); background: var(--cream); color: var(--ground); font: 800 min(var(--t-tick), calc((var(--panel) - var(--strip) - var(--pad) * 2) / 1.81))/.96 var(--display); text-transform: uppercase; }
 body.over #drop-sheet { display: flex; }
-body.over #slot, body.over #new-lobby { display: none; }
+body.over #slot, body.over #give-up { display: none; }
 
 /* ---- which screen is up ---- */
 #list, #lobby, #world { display: none; }
@@ -509,6 +509,7 @@ li.seat.open .who { text-box: trim-both cap alphabetic; }
 #pick-seats b.alien { font: 700 calc(var(--t-sub) * .72)/1 var(--text); text-transform: none; letter-spacing: 0; }
 #pick .note-slide, #spawn .note-slide { bottom: var(--plate); }
 #over .note-slide { bottom: var(--rail); }
+#over:has(~ #slot:not([hidden])) .note-slide { bottom: var(--plate); }
 
 .axis { position: relative; width: max-content; margin-top: var(--pad); }
 .axis .cap { position: absolute; top: 0; left: calc(var(--t-tick) + 8px); text-box: trim-both cap alphabetic; }
@@ -721,7 +722,7 @@ if (matchMedia('(prefers-reduced-motion: reduce)').matches) document.documentEle
       <div class="note-slide"><p class="note" id="over-note"></p></div>
     </section>
 
-    <button class="plate" id="new-lobby" data-tone="line" type="button" hidden>New lobby</button>
+    <button class="plate" id="give-up" data-tone="line" type="button" hidden>Give up seat</button>
     <button class="plate" id="slot" type="button" hidden><span class="cap" id="slot-sub" hidden></span><span id="slot-label"></span></button>
     <button class="hold" id="stop" type="button" hidden><span class="lab">Stop match</span><span class="fill" aria-hidden="true">Stop match</span></button>
     <div id="stop-clip"><div id="stop-plate"></div></div>

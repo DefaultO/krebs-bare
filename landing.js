@@ -625,7 +625,7 @@ function paintList(data) {
 
   // your own seat in a match that plays on
   const away = data.lobbies.find(l => l.mine && l.away && l.phase === 'running');
-  $('new-lobby').hidden = !away || !data.me;
+  $('give-up').hidden = !away || !data.me;
   if (!data.me) setSlot(null);
   else if (away) setSlot({ label: 'Rejoin', tone: 'go', act: 'rejoin', sub: `${away.name} ${kilo(away.tick)}`, id: away.id });
   else setSlot({ label: 'New lobby', tone: data.lobbies.some(seatOpen) ? 'cream' : 'go', act: 'create' });
@@ -855,6 +855,12 @@ let uploading = null;
 /** The server's own note, so one that has gone also goes from the page, and one still there does not cover a newer refusal. */
 let serverNote = null;
 
+function paintServerNote(lobby, note) {
+  if ((lobby.note ?? null) === serverNote) return;
+  serverNote = lobby.note ?? null;
+  say(note, serverNote ?? '');
+}
+
 function paintLobby(lobby) {
   const me = seatOf(lobby), preparing = lobby.phase === 'preparing';
   setText($('lobby-name'), lobby.name);
@@ -864,10 +870,7 @@ function paintLobby(lobby) {
   $('drop').hidden = preparing;
   setText($('drop-title'), uploading ?? (me?.hasCode ? 'Code uploaded' : ''));
   setText($('drop-note'), uploading ? '' : me?.hasCode ? 'Drop a folder to replace it.' : 'A folder or a zip, up to 10 MB. No bot yet? Use the starter-bot folder from the Krebs zip.');
-  if ((lobby.note ?? null) !== serverNote) {
-    serverNote = lobby.note ?? null;
-    say($('lobby-note'), serverNote ?? '');
-  }
+  paintServerNote(lobby, $('lobby-note'));
   // the slot always holds the step you owe, and there is only ever one
   if (uploading || preparing) setSlot(null);
   else if (!me?.hasCode) setSlot({ label: 'Pick folder', tone: 'go', act: 'folder' });
@@ -1051,9 +1054,15 @@ function seatsOnMap(lobby) {
   worldMap.changed();
 }
 
+/** What is left of a step that has a deadline. */
+function timeLeft(lobby) {
+  const seconds = Math.ceil(lobby.leftMs / 1000);
+  return `${Math.floor(seconds / 60)}:${pad2(seconds % 60)} left`;
+}
+
 function paintPick(lobby) {
   const me = seatOf(lobby), locked = lobby.seats.filter(s => s.locked).length;
-  setText($('pick-count'), `Locked ${locked} of ${lobby.seats.length}`);
+  setText($('pick-count'), `Locked ${locked} of ${lobby.seats.length}, ${timeLeft(lobby)}`);
   paintRows($('pick-seats'), lobby.seats.map(s => [s.name, JSON.stringify([s.color, s.locked, s.room]), () => pickRow(s)]));
   if (hovered && rivalHas(hovered)) hovered = null;
   paintRoomHead();
@@ -1077,7 +1086,7 @@ function paintTile() {
 
 function paintSpawn(lobby) {
   const me = seatOf(lobby), placed = lobby.seats.filter(s => s.spawned).length;
-  setText($('spawn-count'), `${placed} of ${lobby.seats.length} placed`);
+  setText($('spawn-count'), `${placed} of ${lobby.seats.length} placed, ${timeLeft(lobby)}`);
   paintTile();
   if (me?.spawned) setSlot({ label: 'Placed', tone: 'done' });
   else if (chosenTile) setSlot({ label: 'Place', tone: 'go', act: 'place' });
@@ -1193,6 +1202,7 @@ function paintOver(lobby) {
   $('stop').hidden = lobby.phase !== 'running' || !hostIsMe(lobby);
   setSlot(finished ? { label: 'To list', tone: 'cream', act: 'list' } : null);
   if (finished) paintEnd(lobby);
+  paintServerNote(lobby, $('over-note'));
 }
 
 /** The end sheet's name, as last fitted. */
@@ -1319,7 +1329,7 @@ $('slot').addEventListener('click', e => {
   const { act: step, id } = $('slot').dataset;
   if (step && e.detail < 2) ACTIONS[step](Number(id));
 });
-$('new-lobby').addEventListener('click', e => { if (e.detail < 2) ACTIONS.create(); });
+$('give-up').addEventListener('click', e => { if (e.detail < 2) act('/give-up', undefined, $('list-note')); });
 
 /** A step lands on the click: the page shows it done, and the reply either agrees or puts it back. */
 function setReady(ready) {
@@ -1699,7 +1709,7 @@ function holdable(button, ms, stake, done, plate) {
 function leaveStake() {
   const lobby = last?.lobby;
   if (!lobby || lobby.phase === 'finished' || !seatOf(lobby)) return null;
-  if (lobby.phase === 'running') return 'Match plays on. Seat stays';
+  if (lobby.phase === 'running') return 'Seat stays. Ends if all leave';
   return lobby.phase === 'picking' || lobby.phase === 'spawning' ? 'You are out of this match' : 'Gives up your seat and code';
 }
 

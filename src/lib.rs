@@ -1,6 +1,9 @@
 //! The stock Steam client with everything but the game taken away (`--mods bare`): no menu, no top bar, no profiles, no
 //! market, no messages, no rankings, and none of the endpoints behind them. One button stays, `Exit server`.
 //!
+//! Of core's routes only `OPEN` stays. A player's bot runs in a match's own server and nowhere else, so nobody can upload
+//! code to the main world, place a spawn in it, or keep data in it, and a route core gains later starts out closed.
+//!
 //! The client's menu is built from `serverData.features[].menuData`: each entry splices one section of the default menu,
 //! so `deleteCount` removes what is there and `item` goes in its place. That is how the items go, how `bare.css` gets
 //! loaded (a menu `template` is compiled, and a `<link>` with an absolute URL stays a plain element on the page), and how
@@ -28,9 +31,11 @@ use engine::doc::{Obj, Val};
 use engine::world::UserIdx;
 use util::json::Json;
 
+mod job;
 mod lobbies;
 mod steam;
 mod ticket;
+mod window;
 mod world;
 
 /// The folder to read page files from on every request, so a reconnect shows an edit. run.bat sets it to this mod's
@@ -67,50 +72,51 @@ const SPRITES: &[(&str, &str)] = sprites!("commander-lvl0.svg" "commander-lvl1.s
 const WORLD_VIEW: bool = false;
 /// The real part of what the server card shows after the client's `v`.
 const CARD_VERSION: &str = "0.2";
-/// What the world view reads. `user/world-start-room` alone stops the map opening; the rest closes the way to a room.
+/// Core's routes that stay, which is all the client asks for on connect, with the landing page over the rest.
+/// `/api/version`, `auth/steam-ticket` and the routes of this mod are its own. It also asks for `user/world-start-room`,
+/// which is closed on purpose, and for `steam/news` and `xsolla/active-promotion`, which no server here has, and it gets
+/// past all three. Only what reads the player's own account stays, and none of it writes anything.
+const OPEN: &[(&str, &str)] = &[
+    // how the client checks a token: its 401 is what starts the Steam sign-in, so a stale token depends on it
+    ("GET", "/api/auth/me"),
+    // the top bar waits for this, and the whole page fails to load without it
+    ("GET", "/api/user/messages/unread-count"),
+    // the Steam client alone asks, on every load, for its folder of local scripts. Only the default code can be in there.
+    ("GET", "/api/user/branches"),
+];
+/// What the world view reads, on top of `OPEN`, and only when it is on. `user/world-start-room` closed is what stops the map
+/// opening; the rest closes the way to a room.
 const WORLD_ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/user/world-start-room"),
+    ("GET", "/api/user/world-status"),
+    ("GET", "/api/user/respawn-prohibited-rooms"),
     ("POST", "/api/game/map-stats"),
     ("GET", "/api/game/room-terrain"),
     ("GET", "/api/game/room-status"),
+    ("GET", "/api/game/room-decorations"),
+    ("GET", "/api/game/time"),
+    ("GET", "/api/game/tick"),
     ("GET", "/assets/map/*"),
+    // the map's search box and its owner lookups
+    ("GET", "/api/user/find"),
+    ("GET", "/api/user/rooms"),
+    // every room asks
+    ("GET", "/api/user/decorations/themes"),
+    ("GET", "/api/user/badge-svg"),
 ];
 
 /// The default menu has this many sections. Each is emptied, whatever it holds, so `DELETE_ALL` only has to be enough.
 const MENU_SECTIONS: u32 = 4;
 const DELETE_ALL: u32 = 99;
 
-/// Everything the game itself never calls: the client's other pages and what stood behind them. A few stay because the
-/// map and the room do call them: `user/messages/unread-count` (the whole page fails to load without it), `user/find` and
-/// `user/rooms` (the map's search box and its owner lookups), `user/decorations/themes` and `user/badge-svg`
-/// (every room asks), `register/check-email` (the first-run name screen).
-const GONE: &[(&str, &str)] = &[
-    ("GET", "/"),
-    ("POST", "/api/servers/list"),
-    ("GET", "/api/leaderboard/*"),
-    ("GET", "/api/game/market/*"),
-    ("GET", "/api/game/power-creeps/*"),
-    ("POST", "/api/game/power-creeps/*"),
-    ("GET", "/api/user/messages/index"),
-    ("GET", "/api/user/messages/list"),
-    ("POST", "/api/user/messages/*"),
-    ("GET", "/api/user/stats"),
-    ("GET", "/api/user/overview"),
-    ("GET", "/api/user/money-history"),
-    ("GET", "/api/user/auth-token"),
-    ("GET", "/api/user/decorations/inventory"),
-    ("POST", "/api/user/email"),
-    ("POST", "/api/user/password"),
-    ("POST", "/api/user/notify-prefs"),
-    ("POST", "/api/user/set-steam-visible"),
-    ("POST", "/api/user/tutorial-done"),
-    ("POST", "/api/register/submit"),
-    ("POST", "/api/auth/signin"),
-    ("GET", "/api/auth/query-token"),
-];
-
 fn gone(req: &Request, _ctx: &ApiCtx) -> Response {
     Response::not_found(&req.method, &req.path)
+}
+
+/// Each of core's routes that does not stay, under its own name, as a mod's route comes before core's.
+fn closed_routes() -> Vec<Route> {
+    let stays = |route: &Route| [OPEN, if WORLD_VIEW { WORLD_ROUTES } else { &[] }].concat().contains(&(route.method, route.path));
+    backend::server::routes().into_iter().filter(|route| !stays(route)).map(|route| Route { handler: gone, ..route }).collect()
 }
 
 /// FNV-1a, so the stylesheet's URL changes with its content: the client is one long-lived page, and a page reuses a URL
@@ -315,7 +321,6 @@ impl Mod for Bare {
         r.routes.push(Route { method: "GET", path: "/api/version", handler: version });
         r.routes.push(Route { method: "GET", path: "/assets/bare.css", handler: css });
         r.routes.push(Route { method: "POST", path: "/api/auth/steam-ticket", handler: steam_ticket });
-        r.routes.extend(GONE.iter().map(|&(method, path)| Route { method, path, handler: gone }));
         if !WORLD_VIEW {
             lobbies::init(r.data_dir.clone());
             r.routes.push(Route { method: "GET", path: "/assets/landing.html", handler: page_file });
@@ -331,10 +336,11 @@ impl Mod for Bare {
             r.routes.push(Route { method: "GET", path: "/api/lobbies/live", handler: lobbies::live });
             r.routes.push(Route { method: "GET", path: "/api/lobbies/rooms", handler: lobbies::rooms });
             type Action = fn(&Request, &ApiCtx) -> Response;
-            let actions: [(&'static str, Action); 9] = [
+            let actions: [(&'static str, Action); 10] = [
                 ("/api/lobbies/create", lobbies::create),
                 ("/api/lobbies/join", lobbies::join),
                 ("/api/lobbies/leave", lobbies::leave),
+                ("/api/lobbies/give-up", lobbies::give_up),
                 ("/api/lobbies/ready", lobbies::ready),
                 ("/api/lobbies/pick", lobbies::pick),
                 ("/api/lobbies/lock", lobbies::lock),
@@ -343,14 +349,69 @@ impl Mod for Bare {
                 ("/api/lobbies/upload", lobbies::upload),
             ];
             r.routes.extend(actions.map(|(path, handler)| Route { method: "POST", path, handler }));
-            r.routes.extend(WORLD_ROUTES.iter().map(|&(method, path)| Route { method, path, handler: gone }));
         }
+        // after this mod's own, which take the same paths for /api/version and auth/steam-ticket
+        r.routes.push(Route { method: "GET", path: "/", handler: gone });
+        r.routes.extend(closed_routes());
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn is_closed(method: &str, path: &str) -> bool {
+        closed_routes().iter().any(|route| route.method == method && route.path == path)
+    }
+
+    #[test]
+    fn a_player_cannot_host_code_or_keep_data_in_the_main_world() {
+        for (method, path) in [
+            ("POST", "/api/user/code"),
+            ("POST", "/api/user/clone-branch"),
+            ("POST", "/api/user/memory"),
+            ("POST", "/api/user/memory-segment"),
+            ("POST", "/api/user/console"),
+            ("POST", "/api/user/badge"),
+            ("POST", "/api/user/respawn"),
+            ("POST", "/api/game/place-spawn"),
+            ("POST", "/api/game/create-construction"),
+            ("POST", "/api/game/create-invader"),
+            ("POST", "/api/game/create-flag"),
+            ("POST", "/api/game/add-object-intent"),
+            ("POST", "/api/register/set-username"),
+            ("POST", "/api/register/submit"),
+            ("POST", "/api/auth/signin"),
+            ("POST", "/api/user/password"),
+            ("GET", "/api/user/code"),
+            ("GET", "/api/user/memory"),
+            ("GET", "/assets/map/*"),
+        ] {
+            assert!(is_closed(method, path), "{method} {path}");
+        }
+    }
+
+    #[test]
+    fn nothing_of_cores_that_changes_a_thing_stays_open() {
+        let open: Vec<(&str, &str)> = backend::server::routes().iter().filter(|route| !is_closed(route.method, route.path)).map(|route| (route.method, route.path)).collect();
+        assert_eq!(open, [("GET", "/api/auth/me"), ("GET", "/api/user/messages/unread-count"), ("GET", "/api/user/branches")], "a new line here needs a reason in OPEN");
+    }
+
+    #[test]
+    fn what_stays_open_is_really_there() {
+        let core = backend::server::routes();
+        for (method, path) in OPEN.iter().chain(WORLD_ROUTES) {
+            assert!(core.iter().any(|route| route.method == *method && route.path == *path), "{method} {path}");
+        }
+    }
+
+    #[test]
+    fn the_map_stays_shut_while_the_world_view_is_off() {
+        assert!(!WORLD_VIEW);
+        for (method, path) in WORLD_ROUTES {
+            assert!(is_closed(method, path), "{method} {path}");
+        }
+    }
 
     #[test]
     fn every_menu_section_is_emptied() {

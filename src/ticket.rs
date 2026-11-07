@@ -14,10 +14,11 @@
 //! after it, and at 56 the signed part, then Steam's 128-byte RSA signature of it (PKCS#1 v1.5, SHA-1). The signed part
 //! starts with a u32 of its own length; see `VERSION` and below for the rest. Nothing outside it is worth anything alone.
 
+use crate::window;
 use backend::steam_web::{self, Answer};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Screeps on Steam.
@@ -117,6 +118,11 @@ static WEB_KEY: OnceLock<String> = OnceLock::new();
 /// The players taken, and until when.
 static TAKEN: Mutex<BTreeMap<u64, Instant>> = Mutex::new(BTreeMap::new());
 
+/// Who is being asked about. Every sign-in comes through here, so a panic while it was held must not stop them all.
+fn taken() -> MutexGuard<'static, BTreeMap<u64, Instant>> {
+    TAKEN.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Whether `id` gets a turn now, which then lasts `ASK_GAP` unless a yes gives it back early.
 fn take_turn(taken: &mut BTreeMap<u64, Instant>, id: u64, now: Instant) -> bool {
     taken.retain(|_, until| *until > now);
@@ -131,7 +137,7 @@ fn wait_for_turn(id: u64) -> bool {
     let end = Instant::now() + TURN_WAIT;
     loop {
         let now = Instant::now();
-        if take_turn(&mut TAKEN.lock().unwrap(), id, now) {
+        if take_turn(&mut taken(), id, now) {
             return true;
         }
         if now >= end {
@@ -149,7 +155,7 @@ fn asked(ticket: &str, id: u64) -> Result<(), Refused> {
     }
     let said = verdict(steam_web::ask(web_key, ticket), id);
     if said.is_ok() {
-        TAKEN.lock().unwrap().remove(&id);
+        taken().remove(&id);
     }
     said
 }
@@ -169,7 +175,7 @@ pub(crate) fn key() -> &'static Key {
     KEY.get_or_init(|| {
         let test = std::env::var(TEST_KEY).ok().and_then(|hex| decode(&hex)).and_then(|bytes| Key::try_from(bytes).ok());
         if test.is_some() {
-            println!("{TEST_KEY} is set, so this server takes tickets signed with that key and none from Steam.");
+            window::say(format!("{TEST_KEY} is set, so this server takes tickets signed with that key and none from Steam."));
         }
         test.unwrap_or(STEAM_KEY)
     })
@@ -181,7 +187,7 @@ fn say_refused(why: Refused, now_s: u64) {
     static LAST_MINUTE: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
     let minute = now_s / 60;
     if LAST_MINUTE[why as usize].swap(minute, Ordering::Relaxed) != minute {
-        println!("Refused a sign-in: {}", why.words());
+        window::say(format!("Refused a sign-in: {}", why.words()));
     }
 }
 

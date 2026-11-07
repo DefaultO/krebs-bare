@@ -3,20 +3,31 @@
 //!
 //! A lobby goes Open, Countdown, Preparing, Picking, Spawning, Running, Finished. Players are seated while their landing
 //! page keeps asking; everything in `refresh` happens on those polls. `run` owns the match's world on a thread of its own.
+//!
+//! A seat in a match under way holds one of the `MAX_LIVE_MATCHES`, so nobody gets a second one, and nobody can hold up the
+//! rest: picking and spawning have a deadline, and a match that everyone has left ends. The server's host can stop any
+//! match from its window (`host_line`).
 
 use crate::steam;
-use crate::world::{sectors_for, Link, Map, World};
+use crate::window;
+use crate::world::{random_hex, redirected, sectors_for, Link, Map, World};
 use backend::http::{obj, Request, Response};
 use backend::{field, str_field, ApiCtx};
 use engine::doc::Val;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use util::json::Json;
 
 const MAX_SEATS: usize = 8;
 const COUNTDOWN_MS: u64 = 15_000;
+/// How long everyone has to pick a room. Past it a pick stands, and whoever has none gets a free room.
+const PICKING_MS: u64 = 180_000;
+/// How long everyone has to place a spawn. Past it whoever has not placed one is out.
+const SPAWNING_MS: u64 = 120_000;
+/// How long a match goes on with every seat away, so that looking at the list and going back costs nothing.
+const ALL_AWAY_MS: u64 = 60_000;
 /// The page asks every second, so this is several missed polls.
 const SEAT_GONE_MS: u64 = 15_000;
 /// How long a finished match stays listed.
@@ -24,22 +35,72 @@ const FINISHED_MS: u64 = 600_000;
 /// Matches at once, finished ones aside. Each is a server process of its own with its bots running flat out.
 const MAX_LIVE_MATCHES: usize = 4;
 const TOO_MANY_MATCHES: &str = "Too many matches are running on this server. Press Ready again when one has ended.";
+const IN_A_MATCH: &str = "You still have a seat in another match. Go back to it, give it up, or wait for it to end.";
+const HOST_STOPPED: &str = "The host of this server stopped the match.";
+const HOST_WORDS: &str = "Type matches to see what is running, or stop and a number to end that match.";
 const TICKS: u64 = 1_000_000;
+/// What a match's server may use. Measured with 16 threads: bots that hold all a bot may, with 128 MiB of WebAssembly each,
+/// took 0.6 GiB alone and 4.1 GiB for 8. So there is room for more WebAssembly than that, and it stops a bot that takes all it can.
+const MEMORY_BASE: u64 = 2 << 30;
+const MEMORY_PER_SEAT: u64 = 1 << 30;
 /// What fits in the body a world's `/api/user/code` is sent: `{"branch":"default","modules":...}`.
 const MAX_CODE: usize = backend::http::MAX_BODY - 31;
 /// Of `?rooms=`: more than a whole map's worth of names.
 const MAX_ROOMS_ASKED: usize = 8192;
+/// A world's own users, as its lowered names. A player's account cannot have one.
+const WORLD_USERS: [&str; 3] = ["screeps", "invader", "source keeper"];
 /// Each clears 4.3:1 on plain terrain, and none is the page's green, which only ever means something good.
 const COLORS: [&str; MAX_SEATS] = ["#5fa8e6", "#e0a83e", "#e06a5a", "#a98be8", "#4fc3d9", "#e58fc0", "#d8d4c8", "#b9966f"];
 
 static LOBBIES: Mutex<Lobbies> = Mutex::new(Lobbies::new());
 static MATCHES: OnceLock<PathBuf> = OnceLock::new();
 
+/// The lobbies, even after a panic while something held them: every client connects through them, and a list with one odd
+/// lobby in it beats no server at all until a restart.
+fn lobbies() -> MutexGuard<'static, Lobbies> {
+    LOBBIES.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Where match worlds go; ends whatever a previous server left there.
 pub(crate) fn init(data_dir: PathBuf) {
     let matches = data_dir.join("bare").join("matches");
     crate::world::sweep(&matches);
     let _ = MATCHES.set(matches);
+    read_host_commands();
+}
+
+/// The server's own window takes commands, so ending a match needs no account and nothing that comes over a network.
+fn read_host_commands() {
+    let _ = std::thread::Builder::new().name("host commands".into()).spawn(|| {
+        let mut line = String::new();
+        while std::io::stdin().read_line(&mut line).is_ok_and(|read| read > 0) {
+            let said = host_line(&mut lobbies(), &line);
+            if !said.is_empty() {
+                window::say(said);
+            }
+            line.clear();
+        }
+    });
+}
+
+/// One line typed into the server's window, and what to answer.
+fn host_line(lobbies: &mut Lobbies, line: &str) -> String {
+    match line.split_whitespace().collect::<Vec<_>>().as_slice() {
+        [] => String::new(),
+        ["matches"] => {
+            let live: Vec<String> = lobbies.list.iter().filter(|l| l.phase.has_server()).map(|l| format!("  {}: {}, {}, tick {}, {} seats", l.id, l.title(), l.phase.word(), l.tick, l.seats.len())).collect();
+            if live.is_empty() {
+                "No matches are running.".to_string()
+            } else {
+                live.join("\n")
+            }
+        }
+        ["stop", id] => match id.parse() {
+            Ok(id) if lobbies.host_stop(id) => format!("Stopping match {id}."),
+            _ => format!("There is no match {id}."),
+        },
+        _ => HOST_WORDS.to_string(),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -113,6 +174,8 @@ struct Lobby {
     password: String,
     tick: u64,
     stop: bool,
+    /// Since when every seat has been away, while they are.
+    away_since: Option<u64>,
 }
 
 struct Lobbies {
@@ -130,12 +193,6 @@ pub(crate) struct Card {
     pub(crate) live: usize,
 }
 
-fn random_hex(bytes: usize) -> String {
-    let mut raw = vec![0u8; bytes];
-    util::sys::os_random(&mut raw);
-    raw.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 impl Seat {
     fn new(me: &Player, color: &'static str, now: u64) -> Seat {
         Seat { user: me.id.clone(), name: me.name.clone(), steam: me.steam.clone(), color, account: String::new(), code: None, ready: false, room: None, locked: false, spawned: false, tile: None, seen_ms: now, away: false }
@@ -149,11 +206,15 @@ impl Seat {
 
 /// Each seat's name for an account in a world, which takes `^[a-zA-Z0-9_-]{3,}$` and no two alike: (user, account).
 fn account_names(seats: &[Seat]) -> Vec<(String, String)> {
-    let mut names: Vec<(String, String)> = Vec::new();
+    let mut taken: BTreeSet<String> = WORLD_USERS.iter().map(|name| name.to_string()).collect();
+    let mut names = Vec::new();
     for (i, seat) in seats.iter().enumerate() {
         let clean: String = seat.shown_name().chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-')).collect();
-        let taken = names.iter().any(|(_, name)| name.eq_ignore_ascii_case(&clean));
-        names.push((seat.user.clone(), if clean.len() < 3 || taken { format!("Player{}", i + 1) } else { clean }));
+        let free = |name: &String| !taken.contains(&name.to_ascii_lowercase());
+        let name = Some(clean).filter(|name| name.len() >= 3 && free(name)).or_else(|| (i + 1..).map(|n| format!("Player{n}")).find(free));
+        let name = name.expect("there is always a free number");
+        taken.insert(name.to_ascii_lowercase());
+        names.push((seat.user.clone(), name));
     }
     names
 }
@@ -182,6 +243,7 @@ impl Lobby {
         self.note = Some(note);
         self.map = None;
         self.link = None;
+        self.stop = false;
         for s in &mut self.seats {
             (s.ready, s.room, s.locked, s.spawned, s.tile) = (false, None, false, false, None);
         }
@@ -200,11 +262,35 @@ impl Lobby {
                 self.note = None;
                 return true;
             }
-            Phase::Picking if !self.seats.is_empty() && self.seats.iter().all(|s| s.locked) => self.phase = Phase::Spawning,
+            Phase::Picking if !self.seats.is_empty() && (now >= self.ends_ms || self.seats.iter().all(|s| s.locked)) => {
+                self.pick_for_the_rest();
+                self.phase = Phase::Spawning;
+                self.ends_ms = now + SPAWNING_MS;
+            }
             Phase::Spawning if !self.seats.is_empty() && self.seats.iter().all(|s| s.spawned) => self.phase = Phase::Running,
+            Phase::Spawning if now >= self.ends_ms => self.seats.retain(|s| s.spawned),
             _ => {}
         }
         false
+    }
+
+    /// A pick stands and is locked in, and a seat with none gets the first free room.
+    fn pick_for_the_rest(&mut self) {
+        let rooms: Vec<String> = self.map.as_ref().map_or(Vec::new(), |map| map.claimable.iter().cloned().collect());
+        for i in 0..self.seats.len() {
+            if self.seats[i].room.is_none() {
+                let free = rooms.iter().find(|room| !self.seats.iter().any(|s| s.room.as_ref() == Some(room)));
+                self.seats[i].room = free.cloned();
+            }
+        }
+        self.seats.retain(|s| s.room.is_some());
+        self.seats.iter_mut().for_each(|s| s.locked = true);
+    }
+
+    /// Whether every seat has been away for long enough. Asked by the match itself, as polls stop when everyone has gone.
+    fn abandoned(&mut self, now: u64) -> bool {
+        self.away_since = if self.seats.iter().all(|s| s.away) { self.away_since.or(Some(now)) } else { None };
+        self.away_since.is_some_and(|since| now.saturating_sub(since) >= ALL_AWAY_MS)
     }
 
     fn row(&self, me: Option<&str>, now: u64) -> Json {
@@ -280,6 +366,12 @@ impl Lobbies {
         self.list.iter_mut().find(|l| l.seats.iter().any(|s| s.user == user && !s.away) || l.watchers.iter().any(|(w, _)| w == user))
     }
 
+    /// Whether `user` has a seat in a match under way, apart from lobby `but`. An away seat counts: it needs no polling, so
+    /// without this one account could hold every match slot.
+    fn in_a_match(&self, user: &str, but: Option<u64>) -> bool {
+        self.list.iter().any(|l| Some(l.id) != but && l.phase.has_server() && l.seats.iter().any(|s| s.user == user))
+    }
+
     /// A poll: `me` is here, anyone who stopped asking is not, and the lobbies move on. Returns those whose match starts.
     fn refresh(&mut self, me: Option<&str>, now: u64) -> Vec<u64> {
         let mut started = Vec::new();
@@ -335,17 +427,39 @@ impl Lobbies {
         self.list.retain(|l| !l.seats.is_empty());
     }
 
-    fn create(&mut self, me: &Player, now: u64) -> u64 {
+    /// An away seat, for good, so that its player can go on to another match. A match that loses its last seat ends.
+    fn give_up(&mut self, user: &str) {
+        for l in &mut self.list {
+            l.seats.retain(|s| s.user != user || !s.away);
+        }
+        self.list.retain(|l| !l.seats.is_empty());
+    }
+
+    /// For the server's host, so any match under way counts, in any phase. False if there is no such match.
+    fn host_stop(&mut self, id: u64) -> bool {
+        let found = self.get(id).filter(|l| l.phase.has_server());
+        found.map(|l| l.stop = true).is_some()
+    }
+
+    fn create(&mut self, me: &Player, now: u64) -> Result<u64, &'static str> {
+        if self.in_a_match(&me.id, None) {
+            return Err(IN_A_MATCH);
+        }
         self.leave(&me.id);
         let id = self.next_id;
         self.next_id += 1;
         let seat = Seat::new(me, COLORS[0], now);
-        self.list.push(Lobby { id, name: format!("{}'s lobby", me.name), seats: vec![seat], watchers: Vec::new(), phase: Phase::Open, ends_ms: 0, note: None, map: None, link: None, password: String::new(), tick: 0, stop: false });
-        id
+        self.list.push(Lobby { id, name: format!("{}'s lobby", me.name), seats: vec![seat], watchers: Vec::new(), phase: Phase::Open, ends_ms: 0, note: None, map: None, link: None, password: String::new(), tick: 0, stop: false, away_since: None });
+        Ok(id)
     }
 
     fn join(&mut self, me: &Player, id: u64, now: u64) -> Result<(), &'static str> {
         let back = self.get(id).is_some_and(|l| l.seats.iter().any(|s| s.user == me.id));
+        // watching takes no seat
+        let seat = !back && self.get(id).is_none_or(|l| l.phase != Phase::Running);
+        if seat && self.in_a_match(&me.id, Some(id)) {
+            return Err(IN_A_MATCH);
+        }
         if !back {
             self.leave(&me.id);
         }
@@ -370,6 +484,10 @@ impl Lobbies {
     }
 
     fn set_ready(&mut self, user: &str, ready: bool) -> Result<(), &'static str> {
+        let id = self.of(user).ok_or("You are not in a lobby.")?.id;
+        if ready && self.in_a_match(user, Some(id)) {
+            return Err(IN_A_MATCH);
+        }
         let lobby = self.of(user).ok_or("You are not in a lobby.")?;
         if !matches!(lobby.phase, Phase::Open | Phase::Countdown) {
             return Err("The match has started.");
@@ -447,13 +565,19 @@ struct Player {
     steam: String,
 }
 
+/// What to call someone: their name on Steam, or failing that a username, which this world may hold at any length and every
+/// reply carries, or failing that the end of their SteamID.
+fn name_of(on_steam: Option<String>, username: Option<&str>, steam: &str) -> String {
+    on_steam.or_else(|| username.and_then(steam::clean_name)).unwrap_or_else(|| format!("Player {}", &steam[steam.len().saturating_sub(4)..]))
+}
+
 /// Who is asking. People go by their name on Steam. A new player has no username in this world, as the landing page covers
 /// the client's name screen, so without a readable profile only the end of their SteamID is left.
 fn player(ctx: &ApiCtx) -> Option<Player> {
     let view = ctx.published.get();
     let st = view.users.get(ctx.user? as usize)?;
     let steam = field(&st.doc, "steam").and_then(Val::as_obj).and_then(|o| str_field(o, "id")).unwrap_or("");
-    let name = steam::picture(steam).name.or_else(|| str_field(&st.doc, "username").map(str::to_string)).unwrap_or_else(|| format!("Player {}", &steam[steam.len().saturating_sub(4)..]));
+    let name = name_of(steam::picture(steam).name, str_field(&st.doc, "username"), steam);
     Some(Player { id: st.id.as_str().to_string(), name, steam: steam.to_string() })
 }
 
@@ -462,23 +586,27 @@ fn now_ms() -> u64 {
 }
 
 /// `{"modules":{...}}`, as the page sends it.
-fn read_code(body: &[u8]) -> Result<Json, &'static str> {
+fn read_code(body: &[u8]) -> Result<Json, String> {
     let text = std::str::from_utf8(body).map_err(|_| "Your code is not UTF-8 text.")?;
     let parsed = Json::parse(text).map_err(|_| "There is no main module.")?;
-    let Some(Json::Obj(modules)) = parsed.get("modules") else { return Err("There is no main module.") };
+    let Some(Json::Obj(modules)) = parsed.get("modules") else { return Err("There is no main module.".into()) };
     if modules.iter().any(|(name, _)| name.starts_with(['$', '.', '/', '\\'])) {
-        return Err("Module names cannot start with $, a dot or a slash.");
+        return Err("Module names cannot start with $, a dot or a slash.".into());
     }
     if modules.iter().any(|(_, m)| !matches!(m, Json::Str(_)) && m.get("binary").and_then(Json::as_str).is_none()) {
-        return Err("Each module is text, or an object holding binary.");
+        return Err("Each module is text, or an object holding binary.".into());
     }
     match modules.iter().find(|(name, _)| name == "main").map(|(_, m)| m) {
         Some(Json::Str(main)) if !main.trim().is_empty() => {}
-        _ => return Err("There is no main module."),
+        _ => return Err("There is no main module.".into()),
     }
     let code = Json::Obj(modules.clone());
+    // the rule the match's own server has, so that what would stop a match at its start is refused here, by name
+    if let Some(problem) = backend::api::user::module_problem(&code) {
+        return Err(format!("A match cannot take this code: {problem}."));
+    }
     if code.stringify().len() > MAX_CODE {
-        return Err("Your code is over 10 MB.");
+        return Err("Your code is over 10 MB.".into());
     }
     Ok(code)
 }
@@ -486,32 +614,65 @@ fn read_code(body: &[u8]) -> Result<Json, &'static str> {
 // ---- the match ----
 
 fn edit(id: u64, f: impl FnOnce(&mut Lobby)) {
-    if let Some(lobby) = LOBBIES.lock().unwrap().get(id) {
+    if let Some(lobby) = lobbies().get(id) {
         f(lobby);
     }
 }
 
 /// `f` of the lobby, or `None` once it is gone.
 fn read<T>(id: u64, f: impl FnOnce(&Lobby) -> T) -> Option<T> {
-    LOBBIES.lock().unwrap().get(id).map(|l| f(l))
+    lobbies().get(id).map(|l| f(l))
 }
 
-fn start_match(id: u64) {
-    std::thread::spawn(move || {
+/// Whoever calls this holds the lobbies, so it hands everything on to a thread of the match's own.
+fn start_match(id: u64) -> bool {
+    let run = move || {
+        window::say(format!("Match {id} is starting. To end it, type stop {id} here and press Enter."));
         if let Err(why) = play(id) {
-            eprintln!("bare: match {id}: {why}");
+            window::warn(format!("bare: match {id}: {why}"));
             edit(id, |l| l.reopen(format!("The match could not start: {why}")));
         }
+    };
+    std::thread::Builder::new().name(format!("match {id}")).spawn(run).is_ok()
+}
+
+/// Starts what `refresh` found is due.
+fn start_matches(lobbies: &mut Lobbies, started: Vec<u64>) {
+    for id in started {
+        if !start_match(id) {
+            if let Some(lobby) = lobbies.get(id) {
+                lobby.reopen("The match could not start, as this PC could not take another thread.".into());
+            }
+        }
+    }
+}
+
+/// How much memory a match of this many may use.
+fn memory_for(players: u32) -> u64 {
+    MEMORY_BASE + MEMORY_PER_SEAT * u64::from(players)
+}
+
+/// The match is over. `note` says why, if that was not the end of its ticks or someone's choice.
+fn finish(id: u64, note: Option<String>) {
+    edit(id, |l| {
+        l.phase = Phase::Finished;
+        l.ends_ms = now_ms() + FINISHED_MS;
+        l.link = None;
+        l.note = note;
     });
 }
 
 fn play(id: u64) -> Result<(), String> {
     let matches = MATCHES.get().ok_or("no data folder")?;
+    if redirected(matches) {
+        return Err(format!("{} is a link to another folder, and the host has to remove it", matches.display()));
+    }
     let dir = matches.join(id.to_string());
     let _ = std::fs::remove_dir_all(&dir);
     let players = read(id, |l| l.seats.len() as u32).ok_or("the lobby is gone")?;
     let seed = u64::from((now_ms() as u32) | 1);
-    let (mut world, map) = World::start(&dir, sectors_for(players), seed)?;
+    let memory = memory_for(players);
+    let (mut world, map) = World::start(&dir, sectors_for(players), seed, memory)?;
     let password = random_hex(16);
     let names = read(id, |l| account_names(&l.seats)).ok_or("the lobby is gone")?;
     for (_, name) in &names {
@@ -528,21 +689,39 @@ fn play(id: u64) -> Result<(), String> {
         l.link = Some(link.clone());
         l.password = password.clone();
         l.phase = Phase::Picking;
+        l.ends_ms = now_ms() + PICKING_MS;
     });
 
-    // Picking and Spawning are the players': `pick`, `lock` and `spawn` move the lobby on
+    // Picking and Spawning are the players': `pick`, `lock` and `spawn` move the lobby on, and `advance` if they don't
     loop {
-        match read(id, |l| l.phase) {
+        match read(id, |l| (l.phase, l.stop)) {
             None => return Ok(()),
-            Some(Phase::Running) => break,
+            Some((_, true)) => {
+                edit(id, |l| l.reopen(HOST_STOPPED.into()));
+                return Ok(());
+            }
+            Some((Phase::Running, _)) => break,
             Some(_) => std::thread::sleep(Duration::from_millis(200)),
         }
     }
 
+    let ended = run_bots(id, &mut world, &link, &password);
+    // whatever it looks like from here, a limit that was hit is why
+    if world.over_memory() {
+        window::warn(format!("bare: match {id} asked for more than its {} GB of memory, so it was ended.", memory >> 30));
+        finish(id, Some(format!("The match ended: a bot asked for more memory than this match's limit of {} GB.", memory >> 30)));
+        return Ok(());
+    }
+    finish(id, ended?);
+    Ok(())
+}
+
+/// Uploads everyone's code and watches the match until it is over. `Some` says why, if that came too soon.
+fn run_bots(id: u64, world: &mut World, link: &Link, password: &str) -> Result<Option<String>, String> {
     // All the code at once, so every bot starts within a few ticks of the others
     let seats = read(id, |l| l.seats.iter().filter_map(|s| Some((s.account.clone(), s.code.clone()?))).collect::<Vec<_>>()).ok_or("the lobby is gone")?;
     for (name, code) in &seats {
-        link.upload(name, &password, code)?;
+        link.upload(name, password, code)?;
     }
     drop(seats);
     edit(id, |l| l.seats.iter_mut().for_each(|s| s.code = None));
@@ -550,22 +729,20 @@ fn play(id: u64) -> Result<(), String> {
     link.play_exactly(TICKS)?;
     loop {
         std::thread::sleep(Duration::from_millis(500));
+        if world.over_memory() {
+            return Ok(None);
+        }
         if world.exited() {
-            return Err("the match server stopped".into());
+            return Ok(Some("The match ended: its server stopped.".into()));
         }
         let played = link.time().map_or(0, |now| now.saturating_sub(start)).min(TICKS);
-        let stopped = read(id, |l| l.stop).unwrap_or(true);
+        let now = now_ms();
+        let stopped = lobbies().get(id).is_none_or(|l| l.stop || l.abandoned(now));
         edit(id, |l| l.tick = l.tick.max(played));
         if stopped || played >= TICKS {
-            break;
+            return Ok(None);
         }
     }
-    edit(id, |l| {
-        l.phase = Phase::Finished;
-        l.ends_ms = now_ms() + FINISHED_MS;
-        l.link = None;
-    });
-    Ok(())
 }
 
 // ---- routes ----
@@ -573,19 +750,17 @@ fn play(id: u64) -> Result<(), String> {
 /// The card's numbers, taken fresh, as a server nobody has open gets no polls to move it on.
 pub(crate) fn card() -> Card {
     let now = now_ms();
-    let mut lobbies = LOBBIES.lock().unwrap();
-    for started in lobbies.refresh(None, now) {
-        start_match(started);
-    }
+    let mut lobbies = lobbies();
+    let started = lobbies.refresh(None, now);
+    start_matches(&mut lobbies, started);
     lobbies.card(now)
 }
 
 fn reply(me: Option<&Player>, lobbies: &mut Lobbies) -> Response {
     let now = now_ms();
     let id = me.map(|m| m.id.as_str());
-    for started in lobbies.refresh(id, now) {
-        start_match(started);
-    }
+    let started = lobbies.refresh(id, now);
+    start_matches(lobbies, started);
     let rows = lobbies.list.iter().map(|l| l.row(id, now)).collect();
     let own = id.and_then(|m| lobbies.of(m).map(|l| l.detail(m, now)));
     let picture = me.map_or_else(steam::Picture::default, |m| steam::picture(&m.steam));
@@ -601,7 +776,7 @@ fn reply(me: Option<&Player>, lobbies: &mut Lobbies) -> Response {
 /// A change by the player asking, and the same reply a poll gets, or the reason in `error`.
 fn act(ctx: &ApiCtx, f: impl FnOnce(&Player, &mut Lobbies) -> Result<(), &'static str>) -> Response {
     let Some(me) = player(ctx) else { return Response::unauthorized() };
-    let mut lobbies = LOBBIES.lock().unwrap();
+    let mut lobbies = lobbies();
     match f(&me, &mut lobbies) {
         Ok(()) => reply(Some(&me), &mut lobbies),
         Err(why) => Response::error(why),
@@ -610,15 +785,12 @@ fn act(ctx: &ApiCtx, f: impl FnOnce(&Player, &mut Lobbies) -> Result<(), &'stati
 
 /// GET /api/lobbies
 pub(crate) fn list(_req: &Request, ctx: &ApiCtx) -> Response {
-    reply(player(ctx).as_ref(), &mut LOBBIES.lock().unwrap())
+    reply(player(ctx).as_ref(), &mut lobbies())
 }
 
 /// POST /api/lobbies/create
 pub(crate) fn create(_req: &Request, ctx: &ApiCtx) -> Response {
-    act(ctx, |me, l| {
-        l.create(me, now_ms());
-        Ok(())
-    })
+    act(ctx, |me, l| l.create(me, now_ms()).map(|_| ()))
 }
 
 /// POST /api/lobbies/join {id}
@@ -631,6 +803,14 @@ pub(crate) fn join(req: &Request, ctx: &ApiCtx) -> Response {
 pub(crate) fn leave(_req: &Request, ctx: &ApiCtx) -> Response {
     act(ctx, |me, l| {
         l.leave(&me.id);
+        Ok(())
+    })
+}
+
+/// POST /api/lobbies/give-up: your seat in a match you left, for good.
+pub(crate) fn give_up(_req: &Request, ctx: &ApiCtx) -> Response {
+    act(ctx, |me, l| {
+        l.give_up(&me.id);
         Ok(())
     })
 }
@@ -659,7 +839,7 @@ pub(crate) fn spawn(req: &Request, ctx: &ApiCtx) -> Response {
     let body = req.body();
     let (x, y) = (body.get("x").and_then(Json::as_f64).unwrap_or(-1.0) as i32, body.get("y").and_then(Json::as_f64).unwrap_or(-1.0) as i32);
     let target = {
-        let mut lobbies = LOBBIES.lock().unwrap();
+        let mut lobbies = lobbies();
         lobbies.of(&me.id).and_then(|l| {
             let seat = l.seats.iter().find(|s| s.user == me.id)?;
             (l.phase == Phase::Spawning && !seat.spawned).then(|| Some((l.id, l.link.clone()?, seat.account.clone(), l.password.clone(), seat.room.clone()?))).flatten()
@@ -675,7 +855,7 @@ pub(crate) fn spawn(req: &Request, ctx: &ApiCtx) -> Response {
             seat.tile = Some((x, y));
         }
     });
-    reply(Some(&me), &mut LOBBIES.lock().unwrap())
+    reply(Some(&me), &mut lobbies())
 }
 
 /// POST /api/lobbies/stop: the host ends a running match.
@@ -693,11 +873,18 @@ pub(crate) fn stop(_req: &Request, ctx: &ApiCtx) -> Response {
 /// GET /api/lobbies/live: the run you are in or watching, from its own server, so outside the lock every poll waits on.
 pub(crate) fn live(_req: &Request, ctx: &ApiCtx) -> Response {
     let Some(me) = player(ctx) else { return Response::unauthorized() };
-    let Some(link) = LOBBIES.lock().unwrap().running_link(&me.id) else { return Response::error("There is no match running.") };
+    let Some(link) = lobbies().running_link(&me.id) else { return Response::error("There is no match running.") };
     match link.view() {
         Ok(view) => Response::ok(view),
         Err(why) => Response::error(&why),
     }
+}
+
+/// The names in `wanted` that are on this map, each once. A repeat would have the world send the whole room again, so
+/// a short list could ask for hundreds of megabytes.
+fn rooms_on_map(wanted: &str, map: &Map) -> String {
+    let mut seen = BTreeSet::new();
+    wanted.split(',').filter(|name| map.rooms.binary_search_by(|room| room.as_str().cmp(name)).is_ok() && seen.insert(*name)).collect::<Vec<_>>().join(",")
 }
 
 /// GET /api/lobbies/rooms?rooms=W1N1,W2N1: what is in the rooms the page has on screen, as the match's world holds them.
@@ -708,8 +895,12 @@ pub(crate) fn rooms(req: &Request, ctx: &ApiCtx) -> Response {
     if wanted.len() > MAX_ROOMS_ASKED || !wanted.bytes().all(|b| b.is_ascii_alphanumeric() || b == b',') {
         return Response::error("Those are not room names.");
     }
-    let Some(link) = LOBBIES.lock().unwrap().running_link(&me.id) else { return Response::error("There is no match running.") };
-    match link.rooms(wanted) {
+    let found = {
+        let mut lobbies = lobbies();
+        lobbies.running_link(&me.id).zip(lobbies.of(&me.id).and_then(|l| l.map.clone()))
+    };
+    let Some((link, map)) = found else { return Response::error("There is no match running.") };
+    match link.rooms(&rooms_on_map(wanted, &map)) {
         Ok(json) => Response::text(200, "application/json; charset=utf-8", &json),
         Err(why) => Response::error(&why),
     }
@@ -718,7 +909,7 @@ pub(crate) fn rooms(req: &Request, ctx: &ApiCtx) -> Response {
 /// GET /api/lobbies/map: the map of the match you are in. It never changes, so the page asks once.
 pub(crate) fn map(_req: &Request, ctx: &ApiCtx) -> Response {
     let Some(me) = player(ctx) else { return Response::unauthorized() };
-    let found = LOBBIES.lock().unwrap().of(&me.id).and_then(|l| l.map.clone());
+    let found = lobbies().of(&me.id).and_then(|l| l.map.clone());
     let Some(map) = found else { return Response::error("There is no map yet.") };
     let rooms = map.rooms.iter().map(|room| {
         let objects = map.objects.get(room).map_or(Vec::new(), |list| {
@@ -746,9 +937,9 @@ pub(crate) fn upload(req: &Request, ctx: &ApiCtx) -> Response {
     let Some(me) = player(ctx) else { return line(401, "Reconnect, then upload again.") };
     let code = match read_code(&req.body) {
         Ok(code) => Arc::new(code),
-        Err(why) => return line(400, why),
+        Err(why) => return line(400, &why),
     };
-    match LOBBIES.lock().unwrap().upload(&me.id, code) {
+    match lobbies().upload(&me.id, code) {
         Ok(lobby) => line(200, &format!("Code uploaded to {lobby}.")),
         Err((status, why)) => line(status, why),
     }
@@ -769,7 +960,7 @@ mod tests {
     /// A lobby of `ids` with code uploaded, hosted by the first.
     fn lobby(ids: &[&str]) -> (Lobbies, u64) {
         let mut l = Lobbies::new();
-        let id = l.create(&player(ids[0]), 0);
+        let id = l.create(&player(ids[0]), 0).unwrap();
         for other in &ids[1..] {
             l.join(&player(other), id, 0).unwrap();
         }
@@ -794,6 +985,7 @@ mod tests {
         let (mut l, id) = lobby(ids);
         let lobby = l.get(id).unwrap();
         lobby.phase = Phase::Picking;
+        lobby.ends_ms = PICKING_MS;
         let claimable = ["W1N1", "W2N1", "W3N1"].map(str::to_string).into_iter().collect();
         lobby.map = Some(Arc::new(Map { rooms: vec![], claimable, terrain: Default::default(), objects: Default::default() }));
         (l, id)
@@ -861,7 +1053,7 @@ mod tests {
         let (mut l, first) = lobby(&["a", "b"]);
         let colors: Vec<&str> = l.get(first).unwrap().seats.iter().map(|s| s.color).collect();
         assert_eq!(colors, [COLORS[0], COLORS[1]]);
-        let second = l.create(&player("c"), 0);
+        let second = l.create(&player("c"), 0).unwrap();
         l.join(&player("a"), second, 0).unwrap();
         assert_eq!(l.get(first).unwrap().seats.len(), 1, "a left the first one");
         assert_eq!(l.get(first).unwrap().seats[0].user, "b", "and b hosts it now");
@@ -882,7 +1074,7 @@ mod tests {
     #[test]
     fn ready_needs_code() {
         let mut l = Lobbies::new();
-        let id = l.create(&player("a"), 0);
+        let id = l.create(&player("a"), 0).unwrap();
         assert_eq!(l.set_ready("a", true), Err("Upload your code first."));
         l.upload("a", code()).unwrap();
         l.set_ready("a", true).unwrap();
@@ -1053,7 +1245,7 @@ mod tests {
         let mut l = Lobbies::new();
         let hosts: Vec<String> = (0..=MAX_LIVE_MATCHES).map(|n| format!("host{n}")).collect();
         for host in &hosts {
-            l.create(&player(host), 0);
+            l.create(&player(host), 0).unwrap();
             l.upload(host, code()).unwrap();
             l.set_ready(host, true).unwrap();
         }
@@ -1110,6 +1302,45 @@ mod tests {
         assert!(read_code(br#"{"modules":{"main":"x()","a":{"binary":"AA=="}}}"#).is_ok());
     }
 
+    /// `(n names, then main)`, as an upload.
+    fn many_modules(n: usize) -> Vec<u8> {
+        let names: Vec<String> = (0..n).map(|i| format!(r#""m{i}":"x""#)).collect();
+        format!(r#"{{"modules":{{{},"main":"x()"}}}}"#, names.join(",")).into_bytes()
+    }
+
+    #[test]
+    fn code_keeps_to_what_the_match_will_take() {
+        let most = backend::api::user::MAX_MODULES;
+        assert!(read_code(&many_modules(most - 1)).is_ok(), "as many as it holds, main included");
+        assert_eq!(read_code(&many_modules(most)).unwrap_err(), "A match cannot take this code: too many modules.");
+        assert_eq!(read_code(&many_modules(5000)).unwrap_err(), "A match cannot take this code: too many modules.");
+        let long = format!(r#"{{"modules":{{"main":"x()","{}":"y"}}}}"#, "n".repeat(300));
+        assert_eq!(read_code(long.as_bytes()).unwrap_err(), "A match cannot take this code: module name is too long.");
+    }
+
+    #[test]
+    fn names_inside_a_module_are_refused() {
+        let keys: Vec<String> = (0..1000).map(|i| format!(r#""k{i}":1"#)).collect();
+        let nested = format!(r#"{{"modules":{{"main":"x()","w":{{"binary":"",{}}}}}}}"#, keys.join(","));
+        let why = read_code(nested.as_bytes()).unwrap_err();
+        assert!(why.starts_with("A match cannot take this code: a module is text"), "{why}");
+    }
+
+    #[test]
+    fn a_match_may_use_more_memory_with_more_seats() {
+        assert_eq!([1, 2, 8].map(memory_for), [3 << 30, 4 << 30, 10 << 30]);
+    }
+
+    #[test]
+    fn a_match_that_ends_early_says_why_on_the_end_screen() {
+        let (mut l, id) = lobby(&["a"]);
+        l.get(id).unwrap().phase = Phase::Running;
+        let lobby = l.get(id).unwrap();
+        lobby.phase = Phase::Finished;
+        lobby.note = Some("why".into());
+        assert_eq!(lobby.detail("a", 0).get("note").and_then(Json::as_str), Some("why"));
+    }
+
     #[test]
     fn code_can_pass_the_games_5_mb_up_to_what_a_world_can_be_sent() {
         let sized = |n: usize| format!(r#"{{"modules":{{"main":"{}"}}}}"#, "x".repeat(n));
@@ -1134,6 +1365,192 @@ mod tests {
         assert_eq!(names(&["Namea", "Player 1234", "Дима"]), ["Namea", "Player1234", "Player3"]);
         assert_eq!(names(&["a b", "ab"]), ["Player1", "Player2"], "too short once cleaned");
         assert_eq!(names(&["A-1", "a-1"]), ["A-1", "Player2"], "a world's names ignore case");
+        assert_eq!(names(&["Player2", "Дима"]), ["Player2", "Player3"], "a fallback is checked too");
+        assert_eq!(names(&["player2", "Player2", "Дима"]), ["player2", "Player3", "Player4"]);
+        assert_eq!(names(&["Дима", "Player1"]), ["Player1", "Player2"]);
+        assert_eq!(names(&["Invader", "Screeps"]), ["Player1", "Player2"], "a world has those already");
+        assert_eq!(names(&["INVADER"]), ["Player1"]);
+    }
+
+    #[test]
+    fn a_name_from_the_world_is_kept_short() {
+        assert_eq!(name_of(Some("Neo".into()), Some("other"), "76561197960287930"), "Neo");
+        assert_eq!(name_of(None, Some(&"x".repeat(10_000_000)), "76561197960287930").chars().count(), 32);
+        assert_eq!(name_of(None, Some("a\u{7}b"), "1"), "ab");
+        assert_eq!(name_of(None, None, "76561197960287930"), "Player 7930");
+    }
+
+    /// Every seat's page asks at once.
+    fn all_poll(l: &mut Lobbies, now: u64) {
+        l.list.iter_mut().flat_map(|lobby| &mut lobby.seats).for_each(|s| s.seen_ms = now);
+        l.refresh(None, now);
+    }
+
+    /// `a` hosts a match that has reached Running, and has gone back to the list.
+    fn away_in_a_match() -> (Lobbies, u64) {
+        let (mut l, id) = lobby(&["a"]);
+        l.get(id).unwrap().phase = Phase::Running;
+        l.leave("a");
+        (l, id)
+    }
+
+    #[test]
+    fn one_account_holds_one_match_counting_seats_it_left() {
+        let (mut l, id) = away_in_a_match();
+        assert_eq!(l.create(&player("a"), 1), Err(IN_A_MATCH));
+        assert_eq!(l.list.len(), 1, "no new lobby");
+        let open = l.create(&player("b"), 1).unwrap();
+        assert_eq!(l.join(&player("a"), open, 1), Err(IN_A_MATCH));
+        assert_eq!(l.get(open).unwrap().seats.len(), 1);
+        assert!(l.of("a").is_none(), "a refused join changes nothing");
+
+        // nor can anyone get in the way of that through ready
+        l.get(open).unwrap().seats.push(Seat::new(&player("a"), COLORS[1], 1));
+        l.upload("a", code()).unwrap();
+        assert_eq!(l.set_ready("a", true), Err(IN_A_MATCH));
+        l.get(open).unwrap().seats.pop();
+
+        l.join(&player("a"), id, 2).unwrap();
+        assert!(l.of("a").is_some(), "their own match stays theirs");
+        l.get(id).unwrap().phase = Phase::Finished;
+        assert!(l.create(&player("a"), 3).is_ok(), "and once it ends they are free");
+    }
+
+    #[test]
+    fn every_phase_of_a_match_counts() {
+        for phase in [Phase::Preparing, Phase::Picking, Phase::Spawning, Phase::Running] {
+            let (mut l, id) = lobby(&["a"]);
+            l.get(id).unwrap().phase = phase;
+            assert_eq!(l.create(&player("a"), 0), Err(IN_A_MATCH), "{phase:?}");
+        }
+    }
+
+    #[test]
+    fn watching_needs_no_free_slot() {
+        let (mut l, _) = away_in_a_match();
+        let other = l.create(&player("b"), 1).unwrap();
+        l.get(other).unwrap().phase = Phase::Running;
+        l.join(&player("a"), other, 1).unwrap();
+        assert!(l.of("a").is_some());
+        assert_eq!(l.get(other).unwrap().seats.len(), 1, "it takes no seat");
+    }
+
+    #[test]
+    fn giving_up_a_seat_frees_its_player_and_ends_only_an_empty_match() {
+        let (mut l, id) = lobby(&["a", "b"]);
+        l.get(id).unwrap().phase = Phase::Running;
+        l.give_up("a");
+        assert_eq!(l.get(id).unwrap().seats.len(), 2, "a seat in use is not given up");
+        l.leave("a");
+        l.give_up("a");
+        assert_eq!(l.get(id).unwrap().seats.len(), 1);
+        assert_eq!(l.get(id).unwrap().seats[0].user, "b", "and b hosts it now");
+        assert!(l.create(&player("a"), 1).is_ok());
+        l.leave("b");
+        l.give_up("b");
+        assert!(l.get(id).is_none(), "nobody left, so it goes, and its thread ends the match");
+    }
+
+    #[test]
+    fn a_seat_that_never_picks_gets_a_free_room_at_the_deadline() {
+        let (mut l, id) = picking(&["a", "b", "c"]);
+        l.pick("a", "W1N1").unwrap();
+        l.lock("a").unwrap();
+        l.pick("b", "W2N1").unwrap();
+        all_poll(&mut l, PICKING_MS - 1);
+        assert_eq!(phase(&mut l, id), Phase::Picking, "not before time");
+        all_poll(&mut l, PICKING_MS);
+        assert_eq!(phase(&mut l, id), Phase::Spawning, "one seat cannot hold the rest up");
+        let lobby = l.get(id).unwrap();
+        assert_eq!(lobby.ends_ms, PICKING_MS + SPAWNING_MS);
+        assert!(lobby.seats.iter().all(|s| s.locked));
+        assert_eq!(lobby.seats.iter().map(|s| s.room.as_deref().unwrap()).collect::<Vec<_>>(), ["W1N1", "W2N1", "W3N1"], "a pick stands, locked in or not");
+    }
+
+    #[test]
+    fn a_seat_with_no_room_left_for_it_is_out() {
+        let (mut l, id) = picking(&["a", "b", "c", "d"]);
+        all_poll(&mut l, PICKING_MS);
+        let lobby = l.get(id).unwrap();
+        assert_eq!(lobby.seats.len(), 3, "the map has three rooms");
+        assert_eq!(lobby.phase, Phase::Spawning);
+    }
+
+    #[test]
+    fn a_seat_that_never_places_a_spawn_is_out_at_the_deadline() {
+        let (mut l, id) = picking(&["a", "b"]);
+        all_poll(&mut l, PICKING_MS);
+        l.get(id).unwrap().seats[0].spawned = true;
+        all_poll(&mut l, PICKING_MS + SPAWNING_MS - 1);
+        assert_eq!(phase(&mut l, id), Phase::Spawning);
+        all_poll(&mut l, PICKING_MS + SPAWNING_MS);
+        all_poll(&mut l, PICKING_MS + SPAWNING_MS);
+        assert_eq!(l.get(id).unwrap().seats.len(), 1);
+        assert_eq!(phase(&mut l, id), Phase::Running, "the rest play");
+    }
+
+    #[test]
+    fn a_lobby_where_nobody_placed_a_spawn_goes() {
+        let (mut l, id) = picking(&["a"]);
+        all_poll(&mut l, PICKING_MS);
+        all_poll(&mut l, PICKING_MS + SPAWNING_MS);
+        assert!(l.get(id).is_none(), "and its thread ends the match");
+    }
+
+    #[test]
+    fn a_match_ends_soon_after_every_seat_is_away() {
+        let (mut l, id) = lobby(&["a", "b"]);
+        l.get(id).unwrap().phase = Phase::Running;
+        assert!(!l.get(id).unwrap().abandoned(0));
+        l.leave("a");
+        assert!(!l.get(id).unwrap().abandoned(1), "one is still there");
+        assert!(!l.get(id).unwrap().abandoned(ALL_AWAY_MS * 2));
+        l.leave("b");
+        let start = ALL_AWAY_MS * 2;
+        assert!(!l.get(id).unwrap().abandoned(start));
+        assert!(!l.get(id).unwrap().abandoned(start + ALL_AWAY_MS - 1), "time to look at the list and go back");
+        l.join(&player("b"), id, start + 1).unwrap();
+        assert!(!l.get(id).unwrap().abandoned(start + ALL_AWAY_MS), "and being back counts");
+        l.leave("b");
+        let again = start + ALL_AWAY_MS + 1;
+        assert!(!l.get(id).unwrap().abandoned(again), "the time starts over");
+        assert!(l.get(id).unwrap().abandoned(again + ALL_AWAY_MS));
+    }
+
+    #[test]
+    fn the_host_of_the_server_can_stop_any_match_from_the_window() {
+        let (mut l, id) = lobby(&["a"]);
+        assert_eq!(host_line(&mut l, "matches\n"), "No matches are running.");
+        assert_eq!(host_line(&mut l, &format!("stop {id}\n")), format!("There is no match {id}."), "a lobby is no match yet");
+        for phase in [Phase::Preparing, Phase::Picking, Phase::Spawning, Phase::Running] {
+            l.get(id).unwrap().phase = phase;
+            l.get(id).unwrap().stop = false;
+            assert_eq!(host_line(&mut l, &format!("  stop {id}\r\n")), format!("Stopping match {id}."));
+            assert!(l.get(id).unwrap().stop, "{phase:?}");
+        }
+        assert!(host_line(&mut l, "matches").contains(&format!("  {id}: Namea's lobby, running, tick 0, 1 seats")));
+        assert_eq!(host_line(&mut l, "stop 99"), "There is no match 99.");
+        assert_eq!(host_line(&mut l, "stop x"), "There is no match x.");
+        assert_eq!(host_line(&mut l, "hello"), HOST_WORDS);
+        assert_eq!(host_line(&mut l, "\n"), "");
+    }
+
+    #[test]
+    fn a_stopped_lobby_can_play_again() {
+        let (mut l, id) = lobby(&["a"]);
+        l.get(id).unwrap().stop = true;
+        l.get(id).unwrap().reopen(HOST_STOPPED.into());
+        assert!(!l.get(id).unwrap().stop, "or its next match would end at once");
+    }
+
+    #[test]
+    fn a_room_is_asked_for_once_and_only_if_it_is_on_the_map() {
+        let map = Map { rooms: ["E1N1", "W1N1", "W2N1"].map(str::to_string).to_vec(), claimable: Default::default(), terrain: Default::default(), objects: Default::default() };
+        assert_eq!(rooms_on_map("W1N1,W2N1", &map), "W1N1,W2N1", "what a page asks for goes through in its order");
+        assert_eq!(rooms_on_map(&vec!["W1N1"; 1600].join(","), &map), "W1N1");
+        assert_eq!(rooms_on_map("W2N1,W1N1,W2N1", &map), "W2N1,W1N1");
+        assert_eq!(rooms_on_map("W9N9,E1N1", &map), "E1N1");
+        assert_eq!(rooms_on_map("", &map), "");
     }
 
     #[test]

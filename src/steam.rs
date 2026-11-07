@@ -6,7 +6,7 @@ use backend::http::obj;
 use std::collections::BTreeMap;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 use util::json::Json;
 
@@ -16,6 +16,8 @@ const REFRESH: Duration = Duration::from_secs(600);
 const MAX_FETCHES: usize = 4;
 /// What Steam itself allows for a profile name.
 const MOST_NAME_CHARS: usize = 32;
+/// `-q` comes first or it does nothing: a .curlrc left on this PC has no say in what gets fetched.
+const CURL_ARGS: [&str; 8] = ["-q", "-sSfL", "--proto", "=https", "--max-time", "5", "--max-filesize", "1000000"];
 /// Where the relative image paths of Steam's profile items live.
 const ITEM_IMAGES: &str = "https://shared.fastly.steamstatic.com/community_assets/images/";
 
@@ -34,6 +36,11 @@ struct Known {
 static KNOWN: Mutex<BTreeMap<String, Known>> = Mutex::new(BTreeMap::new());
 static FETCHES: AtomicUsize = AtomicUsize::new(0);
 
+/// What is known. Every reply asks, so a panic while it was held must not end them all.
+fn all_known() -> MutexGuard<'static, BTreeMap<String, Known>> {
+    KNOWN.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// One of the `MAX_FETCHES`, for as long as this lives.
 struct FetchSlot;
 
@@ -51,7 +58,7 @@ impl Drop for FetchSlot {
 
 /// What is known of a SteamID64 (digits only), and a fetch in the background if that is nothing or it is old.
 pub(crate) fn picture(steam_id: &str) -> Picture {
-    let mut known = KNOWN.lock().unwrap();
+    let mut known = all_known();
     if let Some(k) = known.get(steam_id).filter(|k| k.asked.elapsed() < REFRESH) {
         return k.picture.clone();
     }
@@ -66,7 +73,7 @@ pub(crate) fn picture(steam_id: &str) -> Picture {
     let _ = std::thread::Builder::new().spawn(move || {
         let _slot = slot;
         if let Some(found) = fetch(&id) {
-            if let Some(k) = KNOWN.lock().unwrap().get_mut(&id) {
+            if let Some(k) = all_known().get_mut(&id) {
                 k.picture = found;
             }
         }
@@ -83,13 +90,13 @@ impl Picture {
 }
 
 fn curl(url: &str) -> Option<String> {
-    run_curl("curl", url)
+    run_curl(backend::steam_web::system_program("curl"), url)
 }
 
 /// Nothing at all when curl is missing, fails or times out: a player then keeps the plain picture, and the output of
 /// both streams stays here, so nothing reaches the console.
-fn run_curl(program: &str, url: &str) -> Option<String> {
-    let out = Command::new(program).args(["-sSfL", "--proto", "=https", "--max-time", "5", "--max-filesize", "1000000"]).arg(url).output().ok()?;
+fn run_curl(program: impl AsRef<std::ffi::OsStr>, url: &str) -> Option<String> {
+    let out = Command::new(program).args(CURL_ARGS).arg(url).output().ok()?;
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
@@ -102,7 +109,7 @@ fn fetch(steam_id: &str) -> Option<Picture> {
 }
 
 /// A name as people can set it on Steam, so not trusted to be short or printable.
-fn clean_name(name: &str) -> Option<String> {
+pub(crate) fn clean_name(name: &str) -> Option<String> {
     let kept: String = name.chars().filter(|c| !c.is_control()).take(MOST_NAME_CHARS).collect();
     Some(kept.trim().to_string()).filter(|name| !name.is_empty())
 }
@@ -182,6 +189,11 @@ mod tests {
     }
 
     #[test]
+    fn no_curlrc_has_a_say() {
+        assert_eq!(CURL_ARGS[0], "-q");
+    }
+
+    #[test]
     fn a_missing_curl_is_only_a_missing_picture() {
         assert_eq!(run_curl("krebs-no-such-program", "https://example.invalid/"), None);
     }
@@ -192,7 +204,7 @@ mod tests {
         assert_eq!(held.len(), MAX_FETCHES);
         assert!(FetchSlot::take().is_none());
         assert_eq!(picture("76561197960287930"), Picture::default(), "a new player waits for a slot");
-        assert!(!KNOWN.lock().unwrap().contains_key("76561197960287930"), "and is asked about again later");
+        assert!(!all_known().contains_key("76561197960287930"), "and is asked about again later");
         drop(held);
         let slot = FetchSlot::take();
         assert!(slot.is_some(), "a slot comes back when its fetch ends");
