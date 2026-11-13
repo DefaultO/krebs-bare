@@ -46,7 +46,7 @@ struct FetchSlot;
 
 impl FetchSlot {
     fn take() -> Option<FetchSlot> {
-        FETCHES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| (n < MAX_FETCHES).then_some(n + 1)).ok().map(|_| FetchSlot)
+        FETCHES.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| (n < MAX_FETCHES).then_some(n + 1)).ok().map(|_| FetchSlot)
     }
 }
 
